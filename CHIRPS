@@ -1,0 +1,343 @@
+# ============================================================
+# BLOCK 1 — CHIRPS: precipitação mensal por Terra Indígena
+#
+# Estratégia:
+#   1. Bboxes das TIs em lotes → Export Tasks paralelas no EE
+#   2. Lê CSVs exportados via Google Drive API (não filesystem)
+#   3. Consolida com cache existente de parquets mensais
+# ============================================================
+
+import time
+import shutil
+import io
+from googleapiclient.discovery import build
+from googleapiclient.http import MediaIoBaseDownload
+from google.colab import auth
+
+# ============================================================
+# 1. CORRIGE NOME
+# ============================================================
+
+if "terrai_nome" in tis.columns:
+    tis["ti_name"] = tis["terrai_nome"].astype(str)
+    tis.to_file(DIRS["boundaries"] / "study_tis_cerrado.gpkg",    driver="GPKG")
+    tis.to_file(DIRS["boundaries"] / "study_tis_cerrado.geojson", driver="GeoJSON")
+    console.print("[green]✓ ti_name corrigido: terrai_nome[/green]")
+
+# ============================================================
+# 2. PARÂMETROS
+# ============================================================
+
+CHIRPS_COLLECTION = "UCSB-CHG/CHIRPS/DAILY"
+EE_TILE_SCALE     = 4
+TASK_PREFIX       = "chirps_annual"
+EE_EXPORT_FOLDER  = f"{PROJECT_NAME}/07_exports/chirps"
+MONITOR_INTERVAL  = 30
+MONITOR_TIMEOUT   = 7200
+
+EXPORT_LOCAL_DIR  = DIRS["exports"] / "chirps"
+EXPORT_LOCAL_DIR.mkdir(parents=True, exist_ok=True)
+
+# ============================================================
+# 3. FEATURECOLLECTION VIA BBOXES (funciona sem upload)
+# ============================================================
+
+def build_tis_fc() -> ee.FeatureCollection:
+    """Bboxes das TIs em lotes de 50 — payload mínimo, preciso para CHIRPS 5.5km."""
+    features = []
+    for _, row in tis.iterrows():
+        minx, miny, maxx, maxy = row.geometry.bounds
+        features.append(ee.Feature(
+            ee.Geometry.Rectangle([minx, miny, maxx, maxy]),
+            {"ti_id": int(row["ti_id"]), "ti_name": str(row["ti_name"]),
+             "area_ha": float(row["area_ha"]), "area_km2": float(row["area_km2"])}
+        ))
+
+    batches = [features[i:i+50] for i in range(0, len(features), 50)]
+    fc = ee.FeatureCollection(
+        [ee.FeatureCollection(b) for b in batches]
+    ).flatten()
+    console.print(f"[green]✓ FeatureCollection: {fc.size().getInfo()} TIs (bboxes)[/green]")
+    return fc
+
+# ============================================================
+# 4. EXPORT TASKS
+# ============================================================
+
+def launch_tasks(tis_fc, years=None) -> dict:
+    if years is None:
+        years = list(range(START_YEAR, END_YEAR + 1))
+
+    chirps = ee.ImageCollection(CHIRPS_COLLECTION)
+    tasks  = {}
+
+    for year in years:
+        dest = EXPORT_LOCAL_DIR / f"{TASK_PREFIX}_{year}.csv"
+        if dest.exists() and not FORCE_REPROCESS:
+            console.print(f"[cyan]✓ CSV já existe localmente: {dest.name}[/cyan]")
+            continue
+
+        month_fcs = []
+        for month in range(1, 13):
+            start = ee.Date.fromYMD(year, month, 1)
+            img = chirps.filterDate(start, start.advance(1, "month")).sum().rename("precip_mm")
+            reduced = img.reduceRegions(
+                collection=tis_fc,
+                reducer=ee.Reducer.mean().setOutputs(["precip_mm"]),
+                scale=CHIRPS_SCALE,
+                tileScale=EE_TILE_SCALE,
+            ).map(lambda f: f.set("year", year).set("month", month)
+                             .select(["ti_id", "ti_name", "area_ha", "area_km2",
+                                      "year", "month", "precip_mm"]))
+            month_fcs.append(reduced)
+
+        task = ee.batch.Export.table.toDrive(
+            collection     = ee.FeatureCollection(month_fcs).flatten(),
+            description    = f"{TASK_PREFIX}_{year}",
+            folder         = EE_EXPORT_FOLDER,
+            fileNamePrefix = f"{TASK_PREFIX}_{year}",
+            fileFormat     = "CSV",
+        )
+        task.start()
+        tasks[year] = task
+        console.print(f"[yellow]→ Task: {TASK_PREFIX}_{year}[/yellow]")
+        time.sleep(0.3)
+
+    return tasks
+
+
+def monitor_tasks(tasks: dict) -> dict:
+    if not tasks:
+        return {}
+
+    console.print(f"[cyan]Monitorando {len(tasks)} tasks...[/cyan]")
+    t0, done = time.time(), {}
+
+    while tasks:
+        pending = {}
+        for year, task in tasks.items():
+            state = task.status()["state"]
+            if state in ("COMPLETED", "FAILED", "CANCELLED"):
+                done[year] = state
+                color = "green" if state == "COMPLETED" else "red"
+                console.print(f"  [{color}]{'✓' if state=='COMPLETED' else '✗'} {year}: {state}[/{color}]")
+            else:
+                pending[year] = task
+        tasks = pending
+        if not tasks:
+            break
+        if time.time() - t0 > MONITOR_TIMEOUT:
+            for y in tasks:
+                done[y] = "TIMEOUT"
+            break
+        console.print(f"  [dim]{len(done)}/{len(done)+len(tasks)} | {len(tasks)} pendentes | {MONITOR_INTERVAL}s...[/dim]")
+        time.sleep(MONITOR_INTERVAL)
+
+    ok  = sum(1 for s in done.values() if s == "COMPLETED")
+    bad = [y for y, s in done.items() if s != "COMPLETED"]
+    console.print(f"[bold]Resultado: {ok} OK | {len(bad)} problema(s)[/bold]")
+    if bad:
+        console.print(f"[red]Problemas: {bad}[/red]")
+    return done
+
+# ============================================================
+# 5. BAIXA CSVs VIA GOOGLE DRIVE API (não filesystem)
+# ============================================================
+
+def get_drive_service():
+    """Autentica e retorna o serviço da Google Drive API."""
+    auth.authenticate_user()
+    return build("drive", "v3", cache_discovery=False)
+
+
+def download_csvs_from_drive(years: list) -> dict:
+    """
+    Busca e baixa os CSVs exportados pelo EE usando a Drive API.
+    Retorna dict {year: Path} com os arquivos baixados.
+    """
+    svc = get_drive_service()
+    downloaded = {}
+    years_needed = set(str(y) for y in years)
+
+    console.print("[yellow]→ Buscando CSVs via Google Drive API...[/yellow]")
+
+    # Busca por nome de arquivo
+    for year in years:
+        filename = f"{TASK_PREFIX}_{year}.csv"
+        dest = EXPORT_LOCAL_DIR / filename
+
+        if dest.exists() and not FORCE_REPROCESS:
+            console.print(f"  [cyan]✓ Já baixado: {filename}[/cyan]")
+            downloaded[year] = dest
+            continue
+
+        # Query na Drive API
+        query = f"name='{filename}' and mimeType='text/csv' and trashed=false"
+        results = svc.files().list(
+            q=query,
+            spaces="drive",
+            fields="files(id, name, parents)",
+        ).execute()
+
+        files = results.get("files", [])
+
+        if not files:
+            console.print(f"  [yellow]⚠ Não encontrado: {filename}[/yellow]")
+            continue
+
+        file_id = files[0]["id"]
+        console.print(f"  [dim]Baixando: {filename} (id={file_id})[/dim]")
+
+        request = svc.files().get_media(fileId=file_id)
+        buf = io.BytesIO()
+        downloader = MediaIoBaseDownload(buf, request)
+        done_dl = False
+        while not done_dl:
+            _, done_dl = downloader.next_chunk()
+
+        dest.write_bytes(buf.getvalue())
+        downloaded[year] = dest
+        console.print(f"  [green]✓ Baixado: {filename}[/green]")
+
+    console.print(f"[green]✓ {len(downloaded)}/{len(years)} CSVs baixados.[/green]")
+    return downloaded
+
+# ============================================================
+# 6. CONSOLIDA TUDO
+# ============================================================
+
+def consolidate(csv_paths: list) -> pd.DataFrame:
+    dfs = []
+    for p in sorted(csv_paths):
+        df_tmp = pd.read_csv(p)
+        console.print(f"  [dim]{Path(p).name}: {len(df_tmp):,} linhas[/dim]")
+        dfs.append(df_tmp)
+
+    df = pd.concat(dfs, ignore_index=True)
+
+    if "mean" in df.columns and "precip_mm" not in df.columns:
+        df = df.rename(columns={"mean": "precip_mm"})
+
+    drop = [c for c in df.columns if c.startswith("system:") or c in (".geo", "geo")]
+    df   = df.drop(columns=drop, errors="ignore")
+
+    df["year"]      = pd.to_numeric(df["year"],      errors="coerce").astype("Int64")
+    df["month"]     = pd.to_numeric(df["month"],     errors="coerce").astype("Int64")
+    df["ti_id"]     = pd.to_numeric(df["ti_id"],     errors="coerce").astype("Int64")
+    df["precip_mm"] = pd.to_numeric(df["precip_mm"], errors="coerce").fillna(0)
+
+    df = add_time_fields(df)
+    df = df[df["period"] != "outside"].copy()
+    df = df.sort_values(["ti_id", "year", "month"]).reset_index(drop=True)
+    return df
+
+# ============================================================
+# 7. PIPELINE PRINCIPAL
+# ============================================================
+
+def run_chirps_pipeline() -> pd.DataFrame:
+
+    # ── Etapa 1: FeatureCollection ────────────────────────────────────────
+    console.print("\n[bold cyan]— Etapa 1/4: FeatureCollection —[/bold cyan]")
+    tis_fc = build_tis_fc()
+
+    # ── Etapa 2: Determina quais anos precisam ser processados ────────────
+    console.print("\n[bold cyan]— Etapa 2/4: Verificando anos necessários —[/bold cyan]")
+    all_years    = list(range(START_YEAR, END_YEAR + 1))
+    years_done   = [y for y in all_years
+                    if (EXPORT_LOCAL_DIR / f"{TASK_PREFIX}_{y}.csv").exists()]
+    years_needed = [y for y in all_years if y not in years_done]
+
+    console.print(f"  Anos com CSV local:  {len(years_done)}")
+    console.print(f"  Anos a processar:    {len(years_needed)} {years_needed}")
+
+    # ── Etapa 3: Export Tasks para anos faltantes ─────────────────────────
+    if years_needed:
+        console.print("\n[bold cyan]— Etapa 3/4: Export Tasks —[/bold cyan]")
+        tasks = launch_tasks(tis_fc, years=years_needed)
+
+        if tasks:
+            monitor_tasks(tasks)
+
+        # Baixa CSVs via Drive API
+        console.print("\n[bold cyan]— Etapa 4/4: Download via Drive API —[/bold cyan]")
+        download_csvs_from_drive(years_needed)
+    else:
+        console.print("[green]✓ Todos os anos já têm CSV local.[/green]")
+
+    # ── Etapa 5: Consolida todos os CSVs disponíveis ──────────────────────
+    console.print("\n[bold cyan]— Consolidando —[/bold cyan]")
+    csv_paths = sorted(EXPORT_LOCAL_DIR.glob(f"{TASK_PREFIX}_*.csv"))
+
+    if not csv_paths:
+        raise RuntimeError(
+            "Nenhum CSV disponível após todas as tentativas.\n"
+            "Verifique: https://code.earthengine.google.com/tasks"
+        )
+
+    df = consolidate(csv_paths)
+    console.print(f"[green]✓ {len(df):,} registros consolidados.[/green]")
+    return df
+
+
+# ============================================================
+# 8. EXECUTA
+# ============================================================
+
+chirps_monthly = checkpoint_load_or_run(
+    name  = "chirps_monthly_by_ti",
+    func  = run_chirps_pipeline,
+    ext   = "parquet",
+    force = FORCE_REPROCESS,
+)
+
+# ============================================================
+# 9. SALVA TABELAS FINAIS
+# ============================================================
+
+chirps_monthly.to_csv(    DIRS["tables"] / "chirps_monthly_by_ti.csv",     index=False)
+chirps_monthly.to_parquet(DIRS["tables"] / "chirps_monthly_by_ti.parquet", index=False)
+
+console.print(f"[green]✓ CSV:[/green]     {DIRS['tables'] / 'chirps_monthly_by_ti.csv'}")
+console.print(f"[green]✓ Parquet:[/green] {DIRS['tables'] / 'chirps_monthly_by_ti.parquet'}")
+
+# ============================================================
+# 10. COBERTURA
+# ============================================================
+
+expected = len(tis) * (END_YEAR - START_YEAR + 1) * 12
+actual   = len(chirps_monthly)
+console.print(f"\n[cyan]Cobertura:[/cyan] {actual:,} / {expected:,} ({actual/expected*100:.1f}%)")
+
+tis_missing = set(tis["ti_id"]) - set(chirps_monthly["ti_id"].unique())
+if tis_missing:
+    console.print(f"[yellow]⚠ {len(tis_missing)} TIs sem dados.[/yellow]")
+else:
+    console.print("[green]✓ Todas as TIs com dados.[/green]")
+
+# ============================================================
+# 11. SUMÁRIOS
+# ============================================================
+
+summary_season = (
+    chirps_monthly
+    .groupby(["period", "season"], as_index=False)
+    .agg(n=("precip_mm","count"), media=("precip_mm","mean"),
+         mediana=("precip_mm","median"), dp=("precip_mm","std"),
+         total=("precip_mm","sum"))
+    .round(2)
+)
+
+summary_anual = (
+    chirps_monthly
+    .groupby(["year", "period"], as_index=False)
+    .agg(precip_anual=("precip_mm","sum"), media_mensal=("precip_mm","mean"))
+    .round(2)
+)
+
+summary_season.to_csv(DIRS["stats"] / "summary_chirps_period_season.csv", index=False)
+summary_anual.to_csv( DIRS["stats"] / "summary_chirps_anual.csv",         index=False)
+
+console.print(f"[green]✓ Sumários salvos.[/green]")
+display(summary_season)
+console.print("[bold green]✓ BLOCK 1 concluído com sucesso.[/bold green]")

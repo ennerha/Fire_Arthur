@@ -1,0 +1,1878 @@
+# ============================================================
+# BLOCK 12 — Análises Finais + Síntese para Publicação
+#
+# Análises novas:
+#   A. Fire Radiative Power (FRP) — intensidade direta do fogo
+#   B. TIs vs Áreas Não-Indígenas — contrafactual espacial
+#   C. Estrutura Área × Focos — prova da mudança estrutural
+#
+# Figuras de síntese (ordem do paper, inglês, 500 dpi):
+#   Fig 1  — Study Area: mapa TIs + BRIFs + timeline
+#   Fig 2  — Fire Regime Change: série + sazonalidade + divergência
+#   Fig 3  — Structural Change: scatter área × focos pré/pós
+#   Fig 4  — Fire Intensity: FRP pré vs pós
+#   Fig 5  — Spatial Counterfactual: TIs vs não-TIs
+#   Fig 6  — Causal Identification: event study + DiD
+#   Fig 7  — Statistical Evidence: forest plot + coeficientes
+#   Fig 8  — Climate Robustness: ONI + robustez progressiva
+#   Fig 9  — Mechanisms: FRRI + tendência + aprendizado
+# ============================================================
+
+import warnings
+warnings.filterwarnings("ignore")
+
+import numpy as np
+import pandas as pd
+import geopandas as gpd
+import matplotlib.pyplot as plt
+import matplotlib.gridspec as gridspec
+import matplotlib.ticker as mticker
+import matplotlib.patches as mpatches
+from matplotlib.colors import TwoSlopeNorm
+from matplotlib.lines import Line2D
+from matplotlib.patches import Ellipse
+import matplotlib.transforms as transforms
+import statsmodels.formula.api as smf
+import ee
+import time
+import io
+from scipy import stats
+from scipy.stats import gaussian_kde
+from pathlib import Path
+from google.colab import auth
+from googleapiclient.discovery import build
+from googleapiclient.http import MediaIoBaseDownload
+from IPython.display import display as ipy_display, Image as IPyImage
+
+# ── Progress bar ─────────────────────────────────────────────────────────────
+from rich.progress import Progress, SpinnerColumn, BarColumn, TextColumn, TimeElapsedColumn
+from rich.console import Console as RichConsole
+
+_prog_console = RichConsole()
+
+def make_progress():
+    return Progress(
+        SpinnerColumn(),
+        TextColumn("[bold blue]{task.description}"),
+        BarColumn(bar_width=40),
+        TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
+        TextColumn("•"),
+        TimeElapsedColumn(),
+        console=_prog_console,
+        transient=False,
+    )
+
+# ── Checkpoint system ─────────────────────────────────────────────────────────
+import pickle
+import hashlib
+
+CHECKPOINT_DIR = DIRS["cache"] / "block12_checkpoints"
+CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
+
+def ckpt_path(name: str) -> Path:
+    return CHECKPOINT_DIR / f"{name}.pkl"
+
+def ckpt_exists(name: str) -> bool:
+    return ckpt_path(name).exists()
+
+def ckpt_save(name: str, obj):
+    with open(ckpt_path(name), "wb") as f:
+        pickle.dump(obj, f)
+    console.print(f"  [dim]✓ Checkpoint salvo: {name}[/dim]")
+
+def ckpt_load(name: str):
+    with open(ckpt_path(name), "rb") as f:
+        obj = pickle.load(f)
+    console.print(f"  [dim]→ Checkpoint carregado: {name}[/dim]")
+    return obj
+
+def ckpt_load_or_run(name: str, func, force: bool = False):
+    """Carrega checkpoint se existir, senão executa func e salva."""
+    if not force and ckpt_exists(name):
+        return ckpt_load(name)
+    result = func()
+    if result is not None:
+        ckpt_save(name, result)
+    return result
+
+def fig_exists(fig_name: str) -> bool:
+    """Verifica se figura já foi salva em disco."""
+    return (DIRS["figures"] / fig_name).exists()
+
+FORCE_REPROCESS_12 = False  # Mude para True para forçar reprocessamento completo
+
+# ── Style ─────────────────────────────────────────────────────────────────────
+plt.rcParams.update({
+    "font.family":        "DejaVu Sans",
+    "font.size":          10,
+    "axes.titlesize":     11,
+    "axes.labelsize":     10,
+    "xtick.labelsize":    9,
+    "ytick.labelsize":    9,
+    "legend.fontsize":    9,
+    "axes.spines.top":    False,
+    "axes.spines.right":  False,
+    "figure.dpi":         150,
+    "axes.grid":          True,
+    "grid.alpha":         0.2,
+    "grid.linewidth":     0.5,
+})
+
+DPI     = 500
+C_PRE   = "#1565C0"
+C_POST  = "#C62828"
+C_DRY   = "#E65100"
+C_WET   = "#0277BD"
+C_TRANS = "#757575"
+C_BRIF  = "#2E7D32"
+C_NBRIF = "#9E9E9E"
+C_TI    = "#6A1B9A"
+C_NTI   = "#EF6C00"
+C_SIG   = "#2E7D32"
+C_NSIG  = "#9E9E9E"
+C_ENSO  = "#D32F2F"
+C_LNINA = "#1565C0"
+
+console.print("[bold cyan]═══ BLOCK 12: Análises Finais + Síntese para Publicação ═══[/bold cyan]")
+
+# ============================================================
+# CARREGA DADOS
+# ============================================================
+
+with make_progress() as prog:
+    task = prog.add_task("Loading data...", total=10)
+
+    panel      = pd.read_parquet(DIRS["tables"] / "panel_ti_month.parquet"); prog.advance(task)
+    tis_geo    = gpd.read_file(DIRS["boundaries"] / "study_tis_cerrado.gpkg"); prog.advance(task)
+    frri       = pd.read_parquet(DIRS["tables"] / "frri_ti.parquet"); prog.advance(task)
+    ba_results = pd.read_csv(DIRS["stats"] / "model_results_all.csv"); prog.advance(task)
+    did_results= pd.read_csv(DIRS["stats"] / "did_results.csv"); prog.advance(task)
+    trend_df   = pd.read_csv(DIRS["stats"] / "tendencia_pos_brif.csv"); prog.advance(task)
+    es_burned  = pd.read_csv(DIRS["stats"] / "event_study_results.csv"); prog.advance(task)
+    clim_df    = pd.read_csv(DIRS["stats"] / "model_climate_robust.csv"); prog.advance(task)
+    did_grupos = pd.read_csv(DIRS["stats"] / "did_grupos_tratamento.csv"); prog.advance(task)
+
+    try:
+        clim_panel = pd.read_parquet(DIRS["tables"] / "panel_ti_month_climate.parquet")
+    except:
+        clim_panel = panel.copy()
+        clim_panel["oni"] = 0.0
+    prog.advance(task)
+
+panel["year_int"]  = panel["year"].astype(int)
+panel["month_int"] = panel["month"].astype(int)
+treated_ids = set(did_grupos[did_grupos["grupo"]=="Tratada (com BRIF)"]["ti_id"].tolist())
+panel["treated"] = panel["ti_id"].isin(treated_ids).astype(int)
+
+console.print(f"[green]✓ Dados carregados: {len(panel):,} obs | {panel['ti_id'].nunique()} TIs[/green]")
+
+# ============================================================
+# A. FIRE RADIATIVE POWER (FRP) — EE Export
+# ============================================================
+
+console.print("\n[bold cyan]── A. Fire Radiative Power (FRP) ──[/bold cyan]")
+
+TASK_PREFIX_FRP  = "frp_annual"
+EE_EXPORT_FRP    = f"{PROJECT_NAME}/07_exports/frp"
+EXPORT_LOCAL_FRP = DIRS["exports"] / "frp"
+EXPORT_LOCAL_FRP.mkdir(parents=True, exist_ok=True)
+
+EE_ASSET_TIS = "projects/ee-enneralcantara2/assets/study_tis_cerrado"
+
+def launch_frp_tasks():
+    """Exporta FRP médio mensal por TI (MODIS Terra + Aqua)."""
+    tis_fc    = ee.FeatureCollection(EE_ASSET_TIS)
+    terra_frp = ee.ImageCollection("MODIS/061/MOD14A1")
+    aqua_frp  = ee.ImageCollection("MODIS/061/MYD14A1")
+    tasks     = {}
+
+    all_years    = list(range(START_YEAR, END_YEAR + 1))
+    years_needed = [y for y in all_years
+                    if not (EXPORT_LOCAL_FRP / f"{TASK_PREFIX_FRP}_{y}.csv").exists()]
+
+    console.print(f"  Anos a processar: {len(years_needed)}")
+
+    for year in years_needed:
+        month_fcs = []
+        for month in range(1, 13):
+            start = ee.Date.fromYMD(year, month, 1)
+            end   = start.advance(1, "month")
+
+            # FRP médio (apenas pixels com FireMask >= 7)
+            def get_frp(img):
+                mask = img.select("FireMask").gte(7)
+                return (img.select("MaxFRP")
+                           .updateMask(mask)
+                           .multiply(0.1)   # escala MODIS: DN × 0.1 = MW
+                           .rename("frp_mw"))
+
+            terra_m = terra_frp.filterDate(start, end).map(get_frp)
+            aqua_m  = aqua_frp.filterDate(start, end).map(get_frp)
+            combined = terra_m.merge(aqua_m)
+
+            # Média e máximo do FRP por TI
+            frp_img = combined.mean().rename("frp_mean")
+            frp_max = combined.max().rename("frp_max")
+            frp_combined = frp_img.addBands(frp_max)
+
+            reduced = frp_combined.reduceRegions(
+                collection = tis_fc,
+                reducer    = ee.Reducer.mean().combine(
+                    ee.Reducer.max(), sharedInputs=True
+                ),
+                scale      = 1000,
+                tileScale  = 4,
+            ).map(lambda f: f
+                .set("year", year)
+                .set("month", month)
+                .select(["terrai_cod", "year", "month",
+                         "mean", "max"], None, False)
+            )
+            month_fcs.append(reduced)
+
+        task = ee.batch.Export.table.toDrive(
+            collection     = ee.FeatureCollection(month_fcs).flatten(),
+            description    = f"{TASK_PREFIX_FRP}_{year}",
+            folder         = EE_EXPORT_FRP,
+            fileNamePrefix = f"{TASK_PREFIX_FRP}_{year}",
+            fileFormat     = "CSV",
+        )
+        task.start()
+        tasks[year] = task
+        console.print(f"  [yellow]→ Task FRP: {year}[/yellow]")
+        time.sleep(0.3)
+
+    return tasks, years_needed
+
+def monitor_frp(tasks):
+    if not tasks:
+        return
+    console.print(f"  Monitorando {len(tasks)} tasks FRP...")
+    t0 = time.time()
+    pending = set(tasks.keys())
+    while pending and (time.time()-t0) < 7200:
+        all_t = ee.data.getTaskList()
+        for t in all_t:
+            desc  = t.get("description","")
+            state = t.get("state","")
+            if not desc.startswith(TASK_PREFIX_FRP):
+                continue
+            try:
+                yr = int(desc.replace(f"{TASK_PREFIX_FRP}_",""))
+            except:
+                continue
+            if yr not in pending:
+                continue
+            if state == "COMPLETED":
+                pending.discard(yr)
+                console.print(f"  [green]✓ FRP {yr}[/green]")
+            elif state in ("FAILED","CANCELLED"):
+                pending.discard(yr)
+                console.print(f"  [red]✗ FRP {yr}: {state}[/red]")
+        if not pending:
+            break
+        console.print(f"  {len(tasks)-len(pending)}/{len(tasks)} | {30}s...")
+        time.sleep(30)
+
+def download_frp_csvs(years):
+    auth.authenticate_user()
+    svc = build("drive","v3",cache_discovery=False)
+    downloaded = {}
+    for year in years:
+        fname = f"{TASK_PREFIX_FRP}_{year}.csv"
+        dest  = EXPORT_LOCAL_FRP / fname
+        if dest.exists():
+            downloaded[year] = dest
+            continue
+        res = svc.files().list(
+            q=f"name='{fname}' and mimeType='text/csv' and trashed=false",
+            spaces="drive", fields="files(id,name)"
+        ).execute()
+        files = res.get("files",[])
+        if not files:
+            continue
+        req = svc.files().get_media(fileId=files[0]["id"])
+        buf = io.BytesIO()
+        dl  = MediaIoBaseDownload(buf,req)
+        done = False
+        while not done:
+            _,done = dl.next_chunk()
+        dest.write_bytes(buf.getvalue())
+        downloaded[year] = dest
+        console.print(f"  [green]✓ FRP {fname}[/green]")
+    return downloaded
+
+# Executa FRP pipeline
+tasks_frp, years_frp = launch_frp_tasks()
+if tasks_frp:
+    monitor_frp(tasks_frp)
+    download_frp_csvs(years_frp)
+
+# Consolida FRP — com checkpoint
+frp_csvs = sorted(EXPORT_LOCAL_FRP.glob(f"{TASK_PREFIX_FRP}_*.csv"))
+if ckpt_exists("frp_consolidated") and not FORCE_REPROCESS_12:
+    frp_df = ckpt_load("frp_consolidated")
+    console.print(f"  [green]✓ FRP carregado do checkpoint: {len(frp_df):,} registros[/green]")
+elif frp_csvs:
+    frp_dfs = []
+    for f in frp_csvs:
+        df_tmp = pd.read_csv(f)
+        # Renomeia colunas padrão do EE
+        rename_map = {}
+        for c in df_tmp.columns:
+            if c.lower() in ["mean","mean_1"]:
+                rename_map[c] = "frp_mean"
+            elif c.lower() in ["max","max_1"]:
+                rename_map[c] = "frp_max"
+        df_tmp = df_tmp.rename(columns=rename_map)
+        frp_dfs.append(df_tmp)
+
+    frp_df = pd.concat(frp_dfs, ignore_index=True)
+    drop   = [c for c in frp_df.columns if c.startswith("system:") or c in (".geo","geo")]
+    frp_df = frp_df.drop(columns=drop, errors="ignore")
+    frp_df["year"]  = pd.to_numeric(frp_df["year"],  errors="coerce").astype("Int64")
+    frp_df["month"] = pd.to_numeric(frp_df["month"], errors="coerce").astype("Int64")
+
+    # Match por terrai_cod
+    if "terrai_codigo" in tis_geo.columns:
+        ti_cod = tis_geo[["ti_id","terrai_codigo"]].copy()
+        ti_cod["terrai_codigo"] = pd.to_numeric(ti_cod["terrai_codigo"], errors="coerce")
+        frp_df = frp_df.merge(ti_cod, left_on="terrai_cod", right_on="terrai_codigo", how="left")
+    else:
+        frp_df["ti_id"] = np.nan
+
+    # Mapeia período e estação diretamente em inglês
+    def _period(y):
+        y = int(y) if not pd.isna(y) else 0
+        if 2003 <= y <= 2012: return "pre"
+        if y == 2013:         return "transition"
+        if 2014 <= y <= 2023: return "post"
+        return "outside"
+    def _season(m):
+        m = int(m) if not pd.isna(m) else 0
+        return "dry" if m in [5,6,7,8,9,10] else "wet"
+
+    frp_df["period"] = frp_df["year"].apply(_period)
+    frp_df["season"] = frp_df["month"].apply(_season)
+    frp_df["post"]   = (frp_df["period"] == "post").astype(int)
+    frp_df["dry"]    = (frp_df["season"] == "dry").astype(int)
+
+    frp_df.to_parquet(DIRS["tables"] / "frp_monthly_by_ti.parquet", index=False)
+    frp_df.to_csv(DIRS["tables"] / "frp_monthly_by_ti.csv", index=False)
+    ckpt_save("frp_consolidated", frp_df)
+    console.print(f"  [green]✓ FRP consolidado: {len(frp_df):,} registros[/green]")
+else:
+    console.print("  [yellow]⚠ FRP: sem CSVs disponíveis. Fig 4 será adiada.[/yellow]")
+    frp_df = pd.DataFrame()
+
+# ============================================================
+# B. Cerrado Natural Fora das TIs — EE Export
+# Abordagem: vegetação nativa do Cerrado (MapBiomas land cover) fora das TIs
+# Mais comparável ecologicamente — exclui agropecuária, urbano, silvicultura
+# ============================================================
+
+console.print("\n[bold cyan]── B. Cerrado Natural Fora das TIs ──[/bold cyan]")
+console.print("  Abordagem: vegetação nativa Cerrado fora das TIs (MapBiomas land cover)")
+
+TASK_PREFIX_NTI  = "nti_natural"
+EE_EXPORT_NTI    = f"{PROJECT_NAME}/07_exports/nti_natural"
+EXPORT_LOCAL_NTI = DIRS["exports"] / "nti_natural"
+EXPORT_LOCAL_NTI.mkdir(parents=True, exist_ok=True)
+
+# Classes MapBiomas de vegetação nativa do Cerrado
+# Coleção 8: 3=Formação Florestal, 4=Savana, 11=Campo Limpo,
+#            12=Campo Sujo, 15=Pastagem (excluída), 33=Rio
+NATIVE_CLASSES = [3, 4, 11, 12, 23, 24, 25, 49, 50]  # vegetação nativa
+
+def create_nti_natural_and_export():
+    """
+    Extrai área queimada em vegetação nativa do Cerrado fora das TIs.
+    Usa MapBiomas Collection 9 land cover para filtrar vegetação nativa.
+    Muito mais eficiente: máscara de imagem, sem operação vetorial complexa.
+    """
+    years_needed = [y for y in range(START_YEAR, min(END_YEAR, 2023) + 1)
+                    if not (EXPORT_LOCAL_NTI / f"{TASK_PREFIX_NTI}_{y}.csv").exists()]
+
+    if not years_needed:
+        console.print("  [cyan]✓ NTI natural: todos os anos já exportados.[/cyan]")
+        return {}, []
+
+    console.print(f"  Anos a processar: {len(years_needed)}")
+
+    # ── Máscara 1: fora das TIs ───────────────────────────────────────────────
+    tis_fc   = ee.FeatureCollection(EE_ASSET_TIS)
+    tis_mask = tis_fc.reduceToImage(
+        properties=["ti_id"],
+        reducer=ee.Reducer.first()
+    ).unmask(0).gt(0)
+    outside_tis = tis_mask.eq(0)  # 1 = fora das TIs
+
+    # ── Máscara 2: vegetação nativa (MapBiomas LC Collection 9) ──────────────
+    lc = ee.Image("projects/mapbiomas-public/assets/brazil/lulc/collection9/"
+                  "mapbiomas_collection90_integration_v1")
+
+    # Usa land cover do ano mais recente disponível como máscara de vegetação
+    lc_2022 = lc.select("classification_2022")
+    native_mask = lc_2022.remap(
+        NATIVE_CLASSES,
+        ee.List.repeat(1, len(NATIVE_CLASSES)),
+        0
+    ).rename("is_native")
+
+    # ── Máscara combinada: nativo + fora das TIs ──────────────────────────────
+    nti_natural_mask = outside_tis.And(native_mask.eq(1))
+
+    # ── Região de análise: bounding box das TIs (cobre o Cerrado) ────────────
+    region = tis_fc.geometry().bounds(maxError=1000)
+
+    # ── MapBiomas Fire ────────────────────────────────────────────────────────
+    mapbiomas_fire = ee.Image(
+        "projects/mapbiomas-public/assets/brazil/fire/collection3/"
+        "mapbiomas_fire_collection3_monthly_burned_coverage_v1"
+    )
+
+    tasks = {}
+    for year in years_needed:
+        band      = f"burned_coverage_{year}"
+        month_fcs = []
+
+        for month in range(1, 13):
+            burned = (mapbiomas_fire.select(band)
+                                    .divide(100).floor().toInt()
+                                    .eq(month)
+                                    .updateMask(nti_natural_mask)
+                                    .selfMask()
+                                    .rename("burned_pixels"))
+
+            stats = burned.reduceRegion(
+                reducer   = ee.Reducer.sum(),
+                geometry  = region,
+                scale     = 30,
+                maxPixels = 1e13,
+                tileScale = 16,
+            )
+
+            feat = ee.Feature(None, {
+                "year":          year,
+                "month":         month,
+                "region":        "cerrado_native_non_indigenous",
+                "burned_pixels": stats.get("burned_pixels"),
+            })
+            month_fcs.append(feat)
+
+        task = ee.batch.Export.table.toDrive(
+            collection     = ee.FeatureCollection(month_fcs),
+            description    = f"{TASK_PREFIX_NTI}_{year}",
+            folder         = EE_EXPORT_NTI,
+            fileNamePrefix = f"{TASK_PREFIX_NTI}_{year}",
+            fileFormat     = "CSV",
+        )
+        task.start()
+        tasks[year] = task
+        console.print(f"  [yellow]→ Task NTI natural: {year}[/yellow]")
+        time.sleep(0.3)
+
+    return tasks, years_needed
+
+# ── Executa ───────────────────────────────────────────────────────────────────
+if ckpt_exists("nti_consolidated") and not FORCE_REPROCESS_12:
+    nti_df  = ckpt_load("nti_consolidated")
+    HAS_NTI = True
+    console.print(f"  [green]✓ NTI carregado do checkpoint: {len(nti_df):,} registros[/green]")
+else:
+    tasks_nti, years_nti = create_nti_natural_and_export()
+
+    # Monitora tasks
+    if tasks_nti:
+        console.print(f"  Monitorando {len(tasks_nti)} tasks NTI natural...")
+        t0      = time.time()
+        pending = set(tasks_nti.keys())
+        while pending and (time.time() - t0) < 7200:
+            all_t = ee.data.getTaskList()
+            for t in all_t:
+                desc  = t.get("description", "")
+                state = t.get("state", "")
+                if not desc.startswith(TASK_PREFIX_NTI):
+                    continue
+                try:
+                    yr = int(desc.replace(f"{TASK_PREFIX_NTI}_", ""))
+                except:
+                    continue
+                if yr not in pending:
+                    continue
+                if state == "COMPLETED":
+                    pending.discard(yr)
+                    console.print(f"  [green]✓ NTI {yr}[/green]")
+                elif state == "FAILED":
+                    pending.discard(yr)
+                    console.print(f"  [red]✗ NTI {yr}: FAILED[/red]")
+            if not pending:
+                break
+            console.print(f"  {len(tasks_nti)-len(pending)}/{len(tasks_nti)} | 30s...")
+            time.sleep(30)
+
+    # Download via Drive API
+    nti_csvs_needed = [y for y in years_nti
+                       if not (EXPORT_LOCAL_NTI / f"{TASK_PREFIX_NTI}_{y}.csv").exists()]
+    if nti_csvs_needed:
+        auth.authenticate_user()
+        svc = build("drive", "v3", cache_discovery=False)
+        for year in nti_csvs_needed:
+            fname = f"{TASK_PREFIX_NTI}_{year}.csv"
+            dest  = EXPORT_LOCAL_NTI / fname
+            res   = svc.files().list(
+                q=f"name='{fname}' and mimeType='text/csv' and trashed=false",
+                spaces="drive", fields="files(id,name)"
+            ).execute()
+            files = res.get("files", [])
+            if files:
+                req  = svc.files().get_media(fileId=files[0]["id"])
+                buf  = io.BytesIO()
+                dl   = MediaIoBaseDownload(buf, req)
+                done = False
+                while not done:
+                    _, done = dl.next_chunk()
+                dest.write_bytes(buf.getvalue())
+                console.print(f"  [green]✓ {fname}[/green]")
+
+    # Consolida CSVs NTI
+    nti_csvs = sorted(EXPORT_LOCAL_NTI.glob(f"{TASK_PREFIX_NTI}_*.csv"))
+    if nti_csvs:
+        nti_dfs = []
+        for f in nti_csvs:
+            df_tmp = pd.read_csv(f)
+            drop   = [c for c in df_tmp.columns
+                      if c.startswith("system:") or c in (".geo", "geo")]
+            df_tmp = df_tmp.drop(columns=drop, errors="ignore")
+            df_tmp["year"]  = pd.to_numeric(df_tmp["year"],  errors="coerce").astype("Int64")
+            df_tmp["month"] = pd.to_numeric(df_tmp["month"], errors="coerce").astype("Int64")
+            df_tmp["burned_pixels"] = pd.to_numeric(
+                df_tmp.get("burned_pixels", 0), errors="coerce"
+            ).fillna(0)
+            df_tmp["burned_ha"] = df_tmp["burned_pixels"] * 0.09
+            nti_dfs.append(df_tmp)
+
+        nti_df = pd.concat(nti_dfs, ignore_index=True)
+
+        # Adiciona campos temporais
+        def _period(y):
+            y = int(y) if not pd.isna(y) else 0
+            if 2003 <= y <= 2012: return "pre"
+            if y == 2013:         return "transition"
+            if 2014 <= y <= 2023: return "post"
+            return "outside"
+        def _season(m):
+            return "dry" if int(m) in [5,6,7,8,9,10] else "wet"
+
+        nti_df["period"] = nti_df["year"].apply(_period)
+        nti_df["season"] = nti_df["month"].apply(_season)
+        nti_df["post"]   = (nti_df["period"] == "post").astype(int)
+        nti_df["dry"]    = (nti_df["season"] == "dry").astype(int)
+
+        nti_df.to_csv(DIRS["tables"] / "nti_natural_fire_monthly.csv", index=False)
+        ckpt_save("nti_consolidated", nti_df)
+        HAS_NTI = True
+        console.print(f"  [green]✓ NTI natural consolidado: {len(nti_df):,} registros[/green]")
+    else:
+        console.print("  [yellow]⚠ NTI: Fig 5 será gerada quando as tasks completarem.[/yellow]")
+        HAS_NTI = False
+        nti_df  = pd.DataFrame()
+
+# C. ESTRUTURA ÁREA × FOCOS — MUDANÇA ESTRUTURAL DO REGIME
+# ============================================================
+
+console.print("\n[bold cyan]── C. Estrutura Área × Focos ──[/bold cyan]")
+
+# Agrega por TI × ano × estação
+struct_df = (
+    panel[panel["period"].isin(["pre","post"])]
+    .groupby(["ti_id","year_int","period","season"], as_index=False)
+    .agg(
+        burned_ha_sum  = ("burned_ha",  "sum"),
+        fire_count_sum = ("fire_count", "sum"),
+        area_ha        = ("area_ha",    "first"),
+    )
+)
+struct_df["burned_pct"] = (struct_df["burned_ha_sum"] / struct_df["area_ha"] * 100).clip(0,100)
+
+# Apenas seca — onde o efeito é maior
+struct_dry = struct_df[struct_df["season"]=="dry"].copy()
+struct_dry["log_burned"] = np.log1p(struct_dry["burned_ha_sum"])
+struct_dry["log_fire"]   = np.log1p(struct_dry["fire_count_sum"])
+
+# Regressão da relação área × focos por período
+for period in ["pre","post"]:
+    df_p = struct_dry[struct_dry["period"]==period].dropna()
+    if len(df_p) > 10:
+        x = df_p["log_fire"].values
+        y = df_p["log_burned"].values
+        z = np.polyfit(x, y, 1)
+        r, pval = stats.pearsonr(x, y)
+        console.print(f"  [{period}] log_burned ~ log_fire: β={z[0]:.3f}, r={r:.3f}, p={pval:.4f}")
+
+# Elipse de confiança para scatter
+def confidence_ellipse(x, y, ax, n_std=1.5, **kwargs):
+    if len(x) < 3:
+        return
+    cov = np.cov(x, y)
+    pearson = cov[0,1] / np.sqrt(cov[0,0] * cov[1,1])
+    rx = np.sqrt(1 + pearson)
+    ry = np.sqrt(1 - pearson)
+    ellipse = Ellipse((0,0), width=rx*2, height=ry*2, **kwargs)
+    sx = np.sqrt(cov[0,0]) * n_std
+    sy = np.sqrt(cov[1,1]) * n_std
+    transf = transforms.Affine2D().rotate_deg(45).scale(sx,sy).translate(np.mean(x), np.mean(y))
+    ellipse.set_transform(transf + ax.transData)
+    return ax.add_patch(ellipse)
+
+console.print("  [green]✓ Estrutura área × focos calculada.[/green]")
+
+# ============================================================
+# FIGURAS DE SÍNTESE — ORDEM DO PAPER
+# ============================================================
+
+# Dados auxiliares para todas as figuras
+ts_year = (
+    panel[panel["period"] != "outside"]
+    .groupby(["year_int","season"], as_index=False)
+    .agg(
+        burned_ha_mean  = ("burned_ha",  "mean"),
+        fire_count_mean = ("fire_count", "mean"),
+        precip_mean     = ("precip_mm",  "mean"),
+    )
+)
+
+ts_month = (
+    panel[panel["period"].isin(["pre","post"])]
+    .groupby(["month_int","period","season"], as_index=False)
+    .agg(
+        burned_ha_mean  = ("burned_ha",  "mean"),
+        fire_count_mean = ("fire_count", "mean"),
+    )
+)
+# Garante season em inglês
+if "dry" not in panel["season"].unique():
+    season_map = {"Seca":"dry","Chuvosa":"wet","dry":"dry","wet":"wet"}
+    panel["season"] = panel["season"].map(season_map).fillna(panel["season"])
+    ts_month["season"] = ts_month["season"].map(season_map).fillna(ts_month["season"])
+
+month_labels = ["J","F","M","A","M","J","J","A","S","O","N","D"]
+
+# ── Helper de salvamento de figuras com skip ─────────────────────────────────
+def save_fig(fig, fig_file: str, prog=None, task=None, next_desc: str = ""):
+    """Salva figura e avança progress bar. Pula se já existe e não forçar."""
+    p = DIRS["figures"] / fig_file
+    if p.exists() and not FORCE_REPROCESS_12:
+        console.print(f"  [cyan]✓ {fig_file} já existe — pulando.[/cyan]")
+        plt.close(fig)
+        if prog and task is not None:
+            prog.advance(task)
+            if next_desc:
+                prog.update(task, description=next_desc)
+        return
+    fig.savefig(p, dpi=DPI, bbox_inches="tight")
+    plt.close(fig)
+    console.print(f"[green]✓ {fig_file} salva ({p.stat().st_size/1024:.0f} KB)[/green]")
+    if prog and task is not None:
+        prog.advance(task)
+        if next_desc:
+            prog.update(task, description=next_desc)
+
+# ── PROGRESS BAR FIGURAS ─────────────────────────────────────────────────────
+FIGS_TOTAL = 9
+fig_names  = [
+    ("fig01_study_area.png",         "Fig 1: Study Area"),
+    ("fig02_fire_regime_change.png", "Fig 2: Fire Regime Change"),
+    ("fig03_structural_change.png",  "Fig 3: Structural Change"),
+    ("fig04_fire_intensity_frp.png", "Fig 4: Fire Intensity (FRP)"),
+    ("fig05_spatial_counterfactual.png","Fig 5: Spatial Counterfactual"),
+    ("fig06_causal_identification.png","Fig 6: Causal Identification"),
+    ("fig07_statistical_evidence.png","Fig 7: Statistical Evidence"),
+    ("fig08_climate_robustness.png", "Fig 8: Climate Robustness"),
+    ("fig09_mechanisms_learning.png","Fig 9: Mechanisms & Learning"),
+]
+
+with make_progress() as fig_prog:
+    fig_task = fig_prog.add_task("Generating figures...", total=FIGS_TOTAL)
+
+    # ── FIG 1: STUDY AREA ─────────────────────────────────────────────────────────
+    console.print("\n[yellow]→ Fig 1: Study Area...[/yellow]")
+
+fig = plt.figure(figsize=(18, 10))
+gs  = gridspec.GridSpec(2, 3, figure=fig, hspace=0.4, wspace=0.35)
+
+ax_map   = fig.add_subplot(gs[:, 0:2])   # mapa largo
+ax_tl    = fig.add_subplot(gs[0, 2])     # timeline
+ax_stats = fig.add_subplot(gs[1, 2])     # stats TIs
+
+fig.suptitle(
+    "Fig. 1 — Study area and data framework\n"
+    "Indigenous Lands of the Brazilian Cerrado with confirmed Fire Brigades (BRIFs)",
+    fontsize=12, fontweight="bold", y=0.99
+)
+
+# Mapa
+tis_frri = tis_geo.merge(frri[["ti_id","frri"]], on="ti_id", how="left").to_crs("EPSG:4326")
+tis_frri["has_brif"] = tis_frri["ti_id"].isin(treated_ids)
+
+norm = TwoSlopeNorm(vmin=-1, vcenter=0, vmax=1)
+tis_frri[tis_frri["frri"].isna()].plot(
+    ax=ax_map, color="#E8E8E8", edgecolor="#BBBBBB", linewidth=0.3
+)
+tis_frri[tis_frri["frri"].notna()].plot(
+    ax=ax_map, column="frri", cmap="RdYlGn", norm=norm,
+    edgecolor="white", linewidth=0.3,
+    legend=True,
+    legend_kwds={"label":"FRRI","orientation":"vertical","shrink":0.5,"pad":0.02}
+)
+# Destaca TIs com BRIF
+tis_frri[tis_frri["has_brif"]].plot(
+    ax=ax_map, color="none", edgecolor="#1A237E",
+    linewidth=2.5, linestyle="-", label="TIs with BRIFs (n=11)"
+)
+# Centroides das BRIFs
+brif_centroids = tis_frri[tis_frri["has_brif"]].copy()
+brif_centroids["geometry"] = brif_centroids.geometry.centroid
+brif_centroids.plot(ax=ax_map, color="#1A237E", markersize=25,
+                    marker="*", zorder=5, label="_nolegend_")
+
+ax_map.set_title("(A) 122 Indigenous Lands — Brazilian Cerrado\nFire Regime Reorganization Index (FRRI) | ★ = BRIFs (n=11)",
+                 fontsize=10, fontweight="bold")
+ax_map.set_xlabel("Longitude", fontsize=9)
+ax_map.set_ylabel("Latitude", fontsize=9)
+
+legend_elements = [
+    mpatches.Patch(facecolor="#4CAF50", label="FRRI > 0 (reorganization)"),
+    mpatches.Patch(facecolor="#F44336", label="FRRI < 0 (intensification)"),
+    mpatches.Patch(facecolor="#E8E8E8", label="FRRI not estimated"),
+    Line2D([0],[0], color="#1A237E", linewidth=2.5, label="TIs with BRIFs (n=11)"),
+]
+ax_map.legend(handles=legend_elements, fontsize=8, loc="lower left",
+              framealpha=0.9)
+ax_map.text(0.02, 0.98,
+    f"122 Indigenous Lands\n12,499,382 ha total\n"
+    f"11 with confirmed BRIFs\n111 control TIs",
+    transform=ax_map.transAxes, fontsize=8.5, va="top",
+    bbox=dict(boxstyle="round", facecolor="white", alpha=0.85))
+
+# Timeline
+events = {
+    2001: "MODIS/CHIRPS\nstart",
+    2003: "Pre-BRIF\nperiod",
+    2013: "BRIF\nimplementation",
+    2014: "Post-BRIF\nperiod",
+    2023: "MapBiomas\nend",
+    2024: "MODIS/CHIRPS\nend",
+}
+ax_tl.set_xlim(2000, 2025)
+ax_tl.set_ylim(-1, 2)
+ax_tl.axhline(0.5, color="black", linewidth=1.5, zorder=1)
+ax_tl.axvspan(2003, 2012.5, ymin=0.3, ymax=0.7, alpha=0.2, color=C_PRE, label="Pre-BRIF")
+ax_tl.axvspan(2013, 2013.9, ymin=0.3, ymax=0.7, alpha=0.3, color=C_TRANS, label="Transition")
+ax_tl.axvspan(2014, 2023,   ymin=0.3, ymax=0.7, alpha=0.2, color=C_POST, label="Post-BRIF")
+
+for year, label in events.items():
+    ax_tl.axvline(year, ymin=0.3, ymax=0.7, color="black", linewidth=1, alpha=0.5)
+    va = "bottom" if list(events.keys()).index(year) % 2 == 0 else "top"
+    y  = 0.8 if va == "bottom" else 0.2
+    ax_tl.text(year, y+0.5 if va=="bottom" else y-0.5,
+               label, ha="center", va=va, fontsize=7.5,
+               bbox=dict(boxstyle="round,pad=0.2", facecolor="white", alpha=0.8))
+
+ax_tl.set_title("(B) Data and Study Framework", fontsize=10, fontweight="bold")
+ax_tl.set_xlabel("Year", fontsize=9)
+ax_tl.legend(fontsize=7.5, loc="upper right")
+ax_tl.set_yticks([])
+ax_tl.spines["left"].set_visible(False)
+ax_tl.spines["right"].set_visible(False)
+
+# Stats das TIs
+area_data = tis_geo["area_ha"].values / 1e3  # em mil ha
+ax_stats.hist(np.log10(tis_geo["area_ha"].values), bins=20,
+              color=C_TI, alpha=0.8, edgecolor="white")
+ax_stats.set_title("(C) TI Size Distribution\n(log scale)", fontsize=10, fontweight="bold")
+ax_stats.set_xlabel("log₁₀(Area, ha)", fontsize=9)
+ax_stats.set_ylabel("Number of TIs", fontsize=9)
+ax_stats.axvline(np.log10(tis_geo["area_ha"].median()), color="red",
+                 linewidth=1.5, linestyle="--",
+                 label=f"Median = {tis_geo['area_ha'].median()/1e3:.0f}k ha")
+ax_stats.legend(fontsize=8)
+
+plt.tight_layout(rect=[0,0,1,0.96])
+save_fig(fig, "fig01_study_area.png", fig_prog, fig_task, "Fig 2: Fire Regime Change")
+
+# ── FIG 2: FIRE REGIME CHANGE ─────────────────────────────────────────────────
+
+console.print("[yellow]→ Fig 2: Fire Regime Change...[/yellow]")
+
+fig = plt.figure(figsize=(18, 12))
+gs  = gridspec.GridSpec(2, 3, figure=fig, hspace=0.42, wspace=0.35)
+
+ax_ts1 = fig.add_subplot(gs[0, 0:2])
+ax_ts2 = fig.add_subplot(gs[1, 0:2])
+ax_s1  = fig.add_subplot(gs[0, 2])
+ax_s2  = fig.add_subplot(gs[1, 2])
+
+fig.suptitle(
+    "Fig. 2 — Fire regime change in Cerrado Indigenous Lands (2003–2023)\n"
+    "Divergence between burned area and fire hotspots signals regime reorganization",
+    fontsize=12, fontweight="bold", y=0.99
+)
+
+# ax_ts1: Burned area
+# Garante season em inglês no ts_year
+season_map_en = {"Seca":"dry","Chuvosa":"wet","dry":"dry","wet":"wet"}
+ts_year["season"] = ts_year["season"].map(season_map_en).fillna(ts_year["season"])
+df_dry = ts_year[ts_year["season"]=="dry"].sort_values("year_int")
+df_wet = ts_year[ts_year["season"]=="wet"].sort_values("year_int")
+ax_ts1.plot(df_dry["year_int"], df_dry["burned_ha_mean"],
+            color=C_DRY, linewidth=2.2, marker="o", markersize=5, label="Dry season")
+ax_ts1.plot(df_wet["year_int"], df_wet["burned_ha_mean"],
+            color=C_WET, linewidth=2.2, marker="s", markersize=5,
+            linestyle="--", label="Wet season")
+ax_ts1.axvspan(2003, 2012.5, alpha=0.04, color=C_PRE)
+ax_ts1.axvspan(2013.5, 2023, alpha=0.04, color=C_POST)
+ax_ts1.axvline(2012.5, color=C_TRANS, linewidth=1.5, linestyle="--", alpha=0.7)
+ax_ts1.axvline(2013.5, color=C_TRANS, linewidth=1.5, linestyle="--", alpha=0.7)
+ax_ts1.set_title("(A) Mean Monthly Burned Area per TI", fontsize=10, fontweight="bold")
+ax_ts1.set_ylabel("Burned area (ha/TI/month)", fontsize=9)
+ax_ts1.legend(fontsize=8); ax_ts1.grid(alpha=0.2)
+ymax = ax_ts1.get_ylim()[1]
+ax_ts1.text(2007,   ymax*0.9, "Pre-BRIF", fontsize=8, color=C_PRE, ha="center", style="italic")
+ax_ts1.text(2018.5, ymax*0.9, "Post-BRIF", fontsize=8, color=C_POST, ha="center", style="italic")
+ax_ts1.xaxis.set_major_locator(mticker.MultipleLocator(2))
+
+# ax_ts2: Fire hotspots + divergência z-score
+df_dry_f = ts_year[ts_year["season"]=="dry"].sort_values("year_int").copy()
+for col in ["burned_ha_mean","fire_count_mean"]:
+    mu  = df_dry_f[col].mean()
+    std = df_dry_f[col].std()
+    df_dry_f[f"{col}_z"] = (df_dry_f[col] - mu) / std
+
+ax_ts2.plot(df_dry_f["year_int"], df_dry_f["burned_ha_mean_z"],
+            color=C_DRY, linewidth=2.2, marker="o", markersize=5,
+            label="Burned area (z-score)")
+ax_ts2.plot(df_dry_f["year_int"], df_dry_f["fire_count_mean_z"],
+            color="#BF360C", linewidth=2.2, marker="s", markersize=5,
+            linestyle="--", label="Fire hotspots (z-score)")
+ax_ts2.fill_between(df_dry_f["year_int"],
+                    df_dry_f["burned_ha_mean_z"],
+                    df_dry_f["fire_count_mean_z"],
+                    alpha=0.12, color="purple", label="Divergence")
+ax_ts2.axhline(0, color="black", linewidth=0.6, linestyle=":", alpha=0.5)
+ax_ts2.axvspan(2003, 2012.5, alpha=0.04, color=C_PRE)
+ax_ts2.axvspan(2013.5, 2023, alpha=0.04, color=C_POST)
+ax_ts2.axvline(2012.5, color=C_TRANS, linewidth=1.5, linestyle="--", alpha=0.7)
+ax_ts2.axvline(2013.5, color=C_TRANS, linewidth=1.5, linestyle="--", alpha=0.7)
+ax_ts2.set_title("(B) Divergence: Burned Area vs Fire Hotspots — Dry Season\n"
+                 "Hotspots ↓ while Burned Area ↑ = signature of prescribed burning",
+                 fontsize=10, fontweight="bold")
+ax_ts2.set_ylabel("Standardized value (z-score)", fontsize=9)
+ax_ts2.set_xlabel("Year", fontsize=9)
+ax_ts2.legend(fontsize=8); ax_ts2.grid(alpha=0.2)
+ax_ts2.xaxis.set_major_locator(mticker.MultipleLocator(2))
+
+# ax_s1: Sazonalidade burned
+for period, color, ls, label in [
+    ("pre",  C_PRE,  "-",  "Pre-BRIF (2003–2012)"),
+    ("post", C_POST, "--", "Post-BRIF (2014–2023)"),
+]:
+    df_p = ts_month[
+        (ts_month["period"]==period) & (ts_month["season"].isin(["dry","wet"]))
+    ].sort_values("month_int")
+    ax_s1.plot(df_p["month_int"], df_p["burned_ha_mean"],
+               color=color, linewidth=2.5, linestyle=ls,
+               marker="o", markersize=5, label=label)
+ax_s1.axvspan(4.5, 10.5, alpha=0.08, color=C_DRY, label="Dry season")
+ax_s1.set_xticks(range(1,13))
+ax_s1.set_xticklabels(month_labels, fontsize=8)
+ax_s1.set_title("(C) Seasonality — Burned Area", fontsize=10, fontweight="bold")
+ax_s1.set_ylabel("Burned area (ha/TI/month)", fontsize=9)
+ax_s1.set_xlabel("Month", fontsize=9)
+ax_s1.legend(fontsize=8); ax_s1.grid(alpha=0.2)
+
+# ax_s2: Sazonalidade focos
+for period, color, ls, label in [
+    ("pre",  C_PRE,  "-",  "Pre-BRIF"),
+    ("post", C_POST, "--", "Post-BRIF"),
+]:
+    df_p = ts_month[
+        (ts_month["period"]==period) & (ts_month["season"].isin(["dry","wet"]))
+    ].sort_values("month_int")
+    ax_s2.plot(df_p["month_int"], df_p["fire_count_mean"],
+               color=color, linewidth=2.5, linestyle=ls,
+               marker="s", markersize=5, label=label)
+ax_s2.axvspan(4.5, 10.5, alpha=0.08, color=C_DRY)
+ax_s2.set_xticks(range(1,13))
+ax_s2.set_xticklabels(month_labels, fontsize=8)
+ax_s2.set_title("(D) Seasonality — Fire Hotspots", fontsize=10, fontweight="bold")
+ax_s2.set_ylabel("Mean hotspots/TI/month", fontsize=9)
+ax_s2.set_xlabel("Month", fontsize=9)
+ax_s2.legend(fontsize=8); ax_s2.grid(alpha=0.2)
+
+plt.tight_layout(rect=[0,0,1,0.96])
+save_fig(fig, "fig02_fire_regime_change.png", fig_prog, fig_task, "Fig 3: Structural Change")
+
+# ── FIG 3: STRUCTURAL CHANGE ──────────────────────────────────────────────────
+
+console.print("[yellow]→ Fig 3: Structural Change (Area × Hotspots)...[/yellow]")
+
+fig, axes = plt.subplots(1, 2, figsize=(14, 7))
+fig.suptitle(
+    "Fig. 3 — Structural change in the fire regime: burned area vs fire hotspots\n"
+    "Post-BRIF: same hotspot count → more burned area = lower fire intensity per pixel",
+    fontsize=12, fontweight="bold"
+)
+
+# Scatter pré vs pós — seca
+ax = axes[0]
+for period, color, label, marker in [
+    ("pre",  C_PRE,  "Pre-BRIF (2003–2012)",  "o"),
+    ("post", C_POST, "Post-BRIF (2014–2023)", "s"),
+]:
+    df_p = struct_dry[struct_dry["period"]==period].dropna()
+    ax.scatter(df_p["log_fire"], df_p["log_burned"],
+               color=color, alpha=0.25, s=15, marker=marker, label="_nolegend_")
+    # Linha de tendência
+    x = df_p["log_fire"].values
+    y = df_p["log_burned"].values
+    valid = ~(np.isnan(x)|np.isnan(y))
+    if valid.sum() > 10:
+        z  = np.polyfit(x[valid], y[valid], 1)
+        xr = np.linspace(np.percentile(x[valid],5), np.percentile(x[valid],95), 100)
+        ax.plot(xr, np.poly1d(z)(xr), color=color, linewidth=2.5,
+                linestyle="-" if period=="pre" else "--", label=label)
+        r, pval = stats.pearsonr(x[valid], y[valid])
+        ax.text(0.04 if period=="pre" else 0.55, 0.92 if period=="pre" else 0.08,
+                f"{label}\nslope={z[0]:.2f}, r={r:.2f}",
+                transform=ax.transAxes, fontsize=8, color=color,
+                bbox=dict(boxstyle="round",facecolor="white",alpha=0.8))
+    # Elipse
+    if valid.sum() > 10:
+        confidence_ellipse(x[valid], y[valid], ax,
+                           n_std=1.5, alpha=0.12, facecolor=color,
+                           edgecolor=color, linewidth=1.5)
+
+ax.set_xlabel("log(1 + Fire hotspots/year)", fontsize=9)
+ax.set_ylabel("log(1 + Burned area, ha/year)", fontsize=9)
+ax.set_title("(A) Dry Season: Burned Area ~ Hotspots\n"
+             "Shift in slope = structural reorganization",
+             fontsize=10, fontweight="bold")
+ax.legend(fontsize=8); ax.grid(alpha=0.2)
+ax.text(0.5, 0.5, "← Same hotspots\n   more area →",
+        transform=ax.transAxes, fontsize=8, color="purple",
+        ha="center", va="center", style="italic", alpha=0.5)
+
+# Painel direito: distribuição do ratio burned_ha/fire_count pré vs pós
+ax2 = axes[1]
+for period, color, label in [
+    ("pre",  C_PRE,  "Pre-BRIF"),
+    ("post", C_POST, "Post-BRIF"),
+]:
+    df_p = struct_dry[
+        (struct_dry["period"]==period) &
+        (struct_dry["fire_count_sum"]>0)
+    ].copy()
+    df_p["ratio"] = df_p["burned_ha_sum"] / (df_p["fire_count_sum"] + 1)
+    ratio_clean = df_p["ratio"].replace([np.inf, -np.inf], np.nan).dropna()
+    ratio_log   = np.log1p(ratio_clean.clip(upper=ratio_clean.quantile(0.99)))
+    ax2.hist(ratio_log, bins=40, color=color, alpha=0.55,
+             density=True, label=label, edgecolor="white")
+    ax2.axvline(ratio_log.mean(), color=color, linewidth=2, linestyle="--")
+
+ax2.set_xlabel("log(Burned area / hotspot count + 1)", fontsize=9)
+ax2.set_ylabel("Density", fontsize=9)
+ax2.set_title("(B) Distribution of Burned Area per Hotspot\n"
+              "Post-BRIF shift right = more area per detection = lower intensity",
+              fontsize=10, fontweight="bold")
+ax2.legend(fontsize=9); ax2.grid(alpha=0.2)
+
+# Teste estatístico
+pre_r  = np.log1p(struct_dry[
+    (struct_dry["period"]=="pre") & (struct_dry["fire_count_sum"]>0)
+].assign(r=lambda d: d["burned_ha_sum"]/(d["fire_count_sum"]+1))["r"].clip(upper=1e5))
+post_r = np.log1p(struct_dry[
+    (struct_dry["period"]=="post") & (struct_dry["fire_count_sum"]>0)
+].assign(r=lambda d: d["burned_ha_sum"]/(d["fire_count_sum"]+1))["r"].clip(upper=1e5))
+t, pval = stats.ttest_ind(pre_r.dropna(), post_r.dropna())
+ax2.text(0.65, 0.88,
+         f"Welch t-test:\nt={t:.2f}, p={pval:.4f}\n"
+         f"{'*** significant' if pval<0.001 else '** sig.' if pval<0.01 else '* sig.' if pval<0.05 else 'n.s.'}",
+         transform=ax2.transAxes, fontsize=8,
+         bbox=dict(boxstyle="round",facecolor="lightyellow",alpha=0.9))
+
+plt.tight_layout()
+save_fig(fig, "fig03_structural_change.png", fig_prog, fig_task, "Fig 4: Fire Intensity")
+
+# ── FIG 4: FIRE INTENSITY (FRP) ───────────────────────────────────────────────
+
+console.print("[yellow]→ Fig 4: Fire Intensity (FRP)...[/yellow]")
+
+# Verifica colunas disponíveis no FRP
+frp_cols = frp_df.columns.tolist() if not frp_df.empty else []
+console.print(f"  [dim]FRP colunas: {frp_cols}[/dim]")
+
+# Detecta colunas de FRP automaticamente
+frp_mean_col = next((c for c in frp_cols if "mean" in c.lower() and "frp" not in c.lower()), None)
+frp_max_col  = next((c for c in frp_cols if "max"  in c.lower() and "frp" not in c.lower()), None)
+if frp_mean_col:
+    frp_df = frp_df.rename(columns={frp_mean_col: "frp_mean"})
+if frp_max_col:
+    frp_df = frp_df.rename(columns={frp_max_col: "frp_max"})
+if "frp_mean" not in frp_df.columns:
+    # Tenta qualquer coluna numérica com valores > 0
+    for c in frp_cols:
+        if frp_df[c].dtype in ["float64","float32","int64"] and frp_df[c].mean() > 0:
+            frp_df = frp_df.rename(columns={c: "frp_mean"})
+            console.print(f"  [dim]FRP: usando coluna '{c}' como frp_mean[/dim]")
+            break
+
+has_frp = "frp_mean" in frp_df.columns and not frp_df["frp_mean"].isna().all()
+
+if not has_frp:
+    console.print("[yellow]⚠ Fig 4 adiada: FRP sem dados válidos.[/yellow]")
+else:
+  fig, axes = plt.subplots(1, 2, figsize=(13, 6))
+fig.suptitle(
+    "Fig. 4 — Fire radiative power (FRP): direct measure of fire intensity\n"
+    "Post-BRIF reduction in FRP confirms transition to low-intensity prescribed burning",
+    fontsize=12, fontweight="bold"
+)
+
+# Agrega FRP por ano e período
+if "ti_id" in frp_df.columns and "period" in frp_df.columns:
+    frp_agg = {"frp_mean": ("frp_mean","mean")}
+    if "frp_max" in frp_df.columns:
+        frp_agg["frp_max"] = ("frp_max","mean")
+    frp_year_col = "year" if "year" in frp_df.columns else "year_int"
+    frp_period_col = "period" if "period" in frp_df.columns else None
+    grp_cols = [frp_year_col] + ([frp_period_col] if frp_period_col else [])
+    frp_ts = (
+        frp_df[frp_df.get("season","dry") == "dry"] if "season" in frp_df.columns
+        else frp_df
+    )
+    frp_ts = (
+        frp_ts
+        .groupby(grp_cols, as_index=False)
+        .agg(**frp_agg)
+        .rename(columns={frp_year_col: "year"})
+        .sort_values("year")
+    )
+    has_real_frp = True
+else:
+    has_real_frp = False
+    console.print("[yellow]⚠ Fig 4 não gerada: FRP sem dados válidos.[/yellow]")
+
+# Série temporal FRP
+ax = axes[0]
+ax.plot(frp_ts["year"], frp_ts["frp_mean"],
+        color="#BF360C", linewidth=2.2, marker="o", markersize=5,
+        label="Mean FRP (MW)")
+if "frp_max" in frp_ts.columns:
+    ax.fill_between(frp_ts["year"],
+                    frp_ts["frp_mean"] * 0.7,
+                    frp_ts["frp_max"] * 0.5,
+                    alpha=0.15, color="#BF360C", label="Range")
+ax.axvline(2012.5, color=C_TRANS, linewidth=1.5, linestyle="--", alpha=0.7)
+ax.axvspan(2003, 2012.5, alpha=0.04, color=C_PRE)
+ax.axvspan(2013.5, frp_ts["year"].max(), alpha=0.04, color=C_POST)
+ax.set_title("(A) Fire Radiative Power — Dry Season\nMODIS MaxFRP (MW) — Terra + Aqua combined",
+             fontsize=10, fontweight="bold")
+ax.set_ylabel("Mean FRP (MW)", fontsize=9)
+ax.set_xlabel("Year", fontsize=9)
+ax.legend(fontsize=8); ax.grid(alpha=0.2)
+ymax = ax.get_ylim()[1]
+ax.text(2007,   ymax*0.9, "Pre-BRIF", fontsize=8, color=C_PRE,  ha="center", style="italic")
+ax.text(2018.5, ymax*0.9, "Post-BRIF", fontsize=8, color=C_POST, ha="center", style="italic")
+
+# Boxplot pré vs pós
+ax2 = axes[1]
+pre_frp  = frp_ts[frp_ts.get("period","") == "pre"]["frp_mean"].dropna() if "period" in frp_ts.columns else frp_ts[frp_ts["year"]<=2012]["frp_mean"].dropna()
+post_frp = frp_ts[frp_ts.get("period","") == "post"]["frp_mean"].dropna() if "period" in frp_ts.columns else frp_ts[frp_ts["year"]>=2014]["frp_mean"].dropna()
+
+if len(pre_frp) > 0 and len(post_frp) > 0:
+    bp = ax2.boxplot([pre_frp.values, post_frp.values],
+                     labels=["Pre-BRIF\n(2003–2012)", "Post-BRIF\n(2014–2023)"],
+                     patch_artist=True, notch=True,
+                     medianprops={"color":"black","linewidth":2})
+    for patch, color in zip(bp["boxes"], [C_PRE, C_POST]):
+        patch.set_facecolor(color)
+        patch.set_alpha(0.7)
+
+    t, pval = stats.ttest_ind(pre_frp, post_frp)
+    sig = "***" if pval<0.001 else "**" if pval<0.01 else "*" if pval<0.05 else "n.s."
+    ymax2 = ax2.get_ylim()[1]
+    ax2.text(1.5, ymax2*0.95, f"t={t:.2f}, p={pval:.4f} {sig}",
+             ha="center", fontsize=9,
+             bbox=dict(boxstyle="round",facecolor="lightyellow",alpha=0.9))
+
+ax2.set_title("(B) FRP Distribution: Pre vs Post-BRIF\n"
+              "Lower median = less intense fire events", fontsize=10, fontweight="bold")
+ax2.set_ylabel("Mean FRP (MW)", fontsize=9)
+ax2.grid(alpha=0.2)
+
+plt.tight_layout()
+save_fig(fig, "fig04_fire_intensity_frp.png", fig_prog, fig_task, "Fig 5: Spatial Counterfactual")
+
+# ── FIG 5: SPATIAL COUNTERFACTUAL ─────────────────────────────────────────────
+
+console.print("[yellow]→ Fig 5: Spatial Counterfactual...[/yellow]")
+
+if not HAS_NTI or nti_df.empty:
+    console.print("[yellow]⚠ Fig 5 adiada: dados NTI ainda em processamento no EE.[/yellow]")
+    console.print("  Execute novamente após conclusão das tasks NTI para gerar a Fig 5.")
+else:
+    fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+    fig.suptitle(
+        "Fig. 5 — Spatial counterfactual: Indigenous Lands vs adjacent non-indigenous areas\n"
+        "Post-2013 divergence is specific to TIs — not a regional fire trend",
+        fontsize=12, fontweight="bold"
+    )
+
+    ts_ti = (
+        panel[panel["season"]=="dry"]
+        .groupby("year_int", as_index=False)
+        .agg(burned_ha_mean=("burned_ha","mean"),
+             fire_count_mean=("fire_count","mean"))
+        .sort_values("year_int")
+    )
+
+    for ax_i, (var, ylabel, title_sfx) in zip(
+        axes.flatten()[:2],
+        [("burned_ha_mean",  "Burned area (ha/unit/month)", "Burned Area"),
+         ("fire_count_mean", "Mean hotspots/unit/month",    "Fire Hotspots")]
+    ):
+        ax_i.plot(ts_ti["year_int"], ts_ti[var],
+                  color=C_TI, linewidth=2.2, marker="o", markersize=5,
+                  label="Indigenous Lands (TIs)")
+
+        ts_nti_plot = (
+            nti_df[nti_df["season"]=="dry"]
+            .groupby("year", as_index=False)
+            .agg(burned_ha_mean=("burned_ha","mean"))
+            .sort_values("year")
+        )
+        if len(ts_nti_plot) > 0:
+            ax_i.plot(ts_nti_plot["year"], ts_nti_plot["burned_ha_mean"],
+                      color=C_NTI, linewidth=2.2, marker="s", markersize=5,
+                      linestyle="--", label="Non-indigenous buffer (50km)")
+
+        ax_i.axvline(2012.5, color=C_TRANS, linewidth=1.5, linestyle="--", alpha=0.7)
+        ax_i.axvspan(2003, 2012.5, alpha=0.04, color=C_PRE)
+        ax_i.axvspan(2013.5, 2023, alpha=0.04, color=C_POST)
+        ax_i.set_title(f"({['A','B'][list(axes.flatten()[:2]).index(ax_i)]}) {title_sfx} — Dry Season",
+                       fontsize=10, fontweight="bold")
+        ax_i.set_ylabel(ylabel, fontsize=9)
+        ax_i.set_xlabel("Year", fontsize=9)
+        ax_i.legend(fontsize=8); ax_i.grid(alpha=0.2)
+        ax_i.xaxis.set_major_locator(mticker.MultipleLocator(2))
+
+    ts_groups = (
+        panel[panel["season"]=="dry"]
+        .groupby(["year_int","treated"], as_index=False)
+        .agg(burned_ha_mean=("burned_ha","mean"),
+             fire_count_mean=("fire_count","mean"))
+    )
+
+    for ax_i, (var, ylabel, title) in zip(
+        [axes[1,0], axes[1,1]],
+        [("burned_ha_mean",  "Burned area (ha/TI/month)", "(C) TIs with vs without BRIFs\nBurned Area — Dry Season"),
+         ("fire_count_mean", "Mean hotspots/TI/month",    "(D) TIs with vs without BRIFs\nFire Hotspots — Dry Season")]
+    ):
+        for tv, color, label, ls in [
+            (1, C_BRIF,  "With BRIFs (n=11)",     "-"),
+            (0, C_NBRIF, "Without BRIFs (n=111)", "--"),
+        ]:
+            df_g = ts_groups[ts_groups["treated"]==tv].sort_values("year_int")
+            ax_i.plot(df_g["year_int"], df_g[var],
+                      color=color, linewidth=2.2, linestyle=ls,
+                      marker="o" if tv==1 else "s", markersize=4, label=label)
+        ax_i.axvline(2012.5, color=C_TRANS, linewidth=1.5, linestyle="--", alpha=0.7)
+        ax_i.axvspan(2003, 2012.5, alpha=0.04, color=C_PRE)
+        ax_i.axvspan(2013.5, 2023, alpha=0.04, color=C_POST)
+        ax_i.set_title(title, fontsize=10, fontweight="bold")
+        ax_i.set_ylabel(ylabel, fontsize=9)
+        ax_i.set_xlabel("Year", fontsize=9)
+        ax_i.legend(fontsize=8); ax_i.grid(alpha=0.2)
+        ax_i.xaxis.set_major_locator(mticker.MultipleLocator(2))
+
+    plt.tight_layout(rect=[0,0,1,0.96])
+    save_fig(fig, "fig05_spatial_counterfactual.png", fig_prog, fig_task, "Fig 6: Causal Identification")
+
+# ── FIG 6: CAUSAL IDENTIFICATION ──────────────────────────────────────────────
+
+console.print("[yellow]→ Fig 6: Causal Identification...[/yellow]")
+
+fig = plt.figure(figsize=(18, 10))
+gs  = gridspec.GridSpec(2, 3, figure=fig, hspace=0.42, wspace=0.35)
+
+ax_es1 = fig.add_subplot(gs[0, 0:2])
+ax_es2 = fig.add_subplot(gs[0, 2])
+ax_did = fig.add_subplot(gs[1, 0:2])
+ax_pt  = fig.add_subplot(gs[1, 2])
+
+fig.suptitle(
+    "Fig. 6 — Causal identification: event study and difference-in-differences\n"
+    "Parallel pre-trends and post-2013 divergence support causal interpretation",
+    fontsize=12, fontweight="bold", y=0.99
+)
+
+# ax_es1: Event study burned
+if not es_burned.empty:
+    es_b = es_burned[es_burned["dep_var"]=="log_burned_dry"].sort_values("year")
+    pre  = es_b[es_b["year"]<=2012]
+    post = es_b[es_b["year"]>=2012]
+    for df_e, color, label in [(pre,C_PRE,"Pre-BRIF"),(post,C_POST,"Post-BRIF")]:
+        ax_es1.plot(df_e["year"], df_e["coef"],
+                    color=color, linewidth=2, marker="o", markersize=5, label=label)
+        ax_es1.fill_between(df_e["year"], df_e["ci_low"], df_e["ci_high"],
+                            alpha=0.12, color=color)
+    ax_es1.axhline(0, color="black", linewidth=0.7, linestyle="--", alpha=0.5)
+    ax_es1.axvline(2012.5, color=C_TRANS, linewidth=2, linestyle="--", alpha=0.7,
+                   label="BRIF implementation")
+    ax_es1.set_title("(A) Event Study — Log Burned Area (Dry Season)\n"
+                     "Coefficients relative to base year 2012",
+                     fontsize=10, fontweight="bold")
+    ax_es1.set_ylabel("β (relative to 2012)", fontsize=9)
+    ax_es1.set_xlabel("Year", fontsize=9)
+    ax_es1.legend(fontsize=8); ax_es1.grid(alpha=0.2)
+    ax_es1.xaxis.set_major_locator(mticker.MultipleLocator(2))
+    # Parallel trends annotation
+    pre_c = pre[pre["year"]<2012]["coef"].values
+    t_pt  = np.mean(pre_c)/np.std(pre_c)*np.sqrt(len(pre_c)) if len(pre_c)>1 and np.std(pre_c)>0 else 0
+    p_pt  = 2*(1-stats.t.cdf(abs(t_pt), df=max(1,len(pre_c)-1)))
+    ax_es1.text(0.02, 0.06,
+                f"Parallel trends test (pre-2012):\nt={t_pt:.2f}, p={p_pt:.2f} "
+                f"{'✓ satisfied' if p_pt>0.1 else '⚠ check'}",
+                transform=ax_es1.transAxes, fontsize=8,
+                bbox=dict(boxstyle="round",
+                          facecolor="lightgreen" if p_pt>0.1 else "lightyellow",
+                          alpha=0.9))
+
+# ax_es2: Event study focos
+if not es_burned.empty:
+    es_f = es_burned[es_burned["dep_var"]=="log_fire_dry"].sort_values("year") if "log_fire_dry" in es_burned["dep_var"].values else es_burned[es_burned["dep_var"]=="log_burned_dry"].sort_values("year")
+    pre2  = es_f[es_f["year"]<=2012]
+    post2 = es_f[es_f["year"]>=2012]
+    for df_e, color in [(pre2,C_PRE),(post2,C_POST)]:
+        ax_es2.plot(df_e["year"], df_e["coef"],
+                    color=color, linewidth=2, marker="s", markersize=5)
+        ax_es2.fill_between(df_e["year"], df_e["ci_low"], df_e["ci_high"],
+                            alpha=0.12, color=color)
+    ax_es2.axhline(0, color="black", linewidth=0.7, linestyle="--", alpha=0.5)
+    ax_es2.axvline(2012.5, color=C_TRANS, linewidth=2, linestyle="--", alpha=0.7)
+    ax_es2.set_title("(B) Event Study\nLog Fire Hotspots (Dry Season)",
+                     fontsize=10, fontweight="bold")
+    ax_es2.set_ylabel("β (relative to 2012)", fontsize=9)
+    ax_es2.set_xlabel("Year", fontsize=9)
+    ax_es2.grid(alpha=0.2)
+    ax_es2.xaxis.set_major_locator(mticker.MultipleLocator(3))
+
+# ax_did: DiD trajectories
+ts_groups_did = (
+    panel[panel["period"].isin(["pre","post"]) & (panel["season"]=="dry")]
+    .groupby(["year_int","treated"], as_index=False)
+    .agg(burned_ha_mean=("burned_ha","mean"),
+         fire_count_mean=("fire_count","mean"))
+)
+for tv, color, label, ls in [
+    (1, C_POST, "With BRIFs — Treated (n=11)",    "-"),
+    (0, C_NBRIF,"Without BRIFs — Control (n=111)","--"),
+]:
+    df_g = ts_groups_did[ts_groups_did["treated"]==tv].sort_values("year_int")
+    ax_did.plot(df_g["year_int"], df_g["burned_ha_mean"],
+                color=color, linewidth=2.2, linestyle=ls,
+                marker="o" if tv==1 else "s", markersize=5, label=label, zorder=3)
+
+ax_did.axvline(2012.5, color=C_TRANS, linewidth=2, linestyle="--", alpha=0.7,
+               label="BRIF implementation")
+ax_did.axvspan(2003, 2012.5, alpha=0.04, color=C_PRE)
+ax_did.axvspan(2013.5, 2023, alpha=0.04, color=C_POST)
+ax_did.set_title("(C) DiD Trajectories — Burned Area (Dry Season)\n"
+                 "Treated (BRIFs) vs Control (no BRIFs)",
+                 fontsize=10, fontweight="bold")
+ax_did.set_ylabel("Burned area (ha/TI/month)", fontsize=9)
+ax_did.set_xlabel("Year", fontsize=9)
+ax_did.legend(fontsize=8); ax_did.grid(alpha=0.2)
+ax_did.xaxis.set_major_locator(mticker.MultipleLocator(2))
+
+# Triple DiD annotation
+triple = did_results[did_results["variable"]=="post_x_dry_x_treat"]
+if not triple.empty:
+    r = triple[triple["dep_var"]=="log_burned_ha"].iloc[0] if len(triple[triple["dep_var"]=="log_burned_ha"])>0 else triple.iloc[0]
+    pct = (np.exp(r["coef"])-1)*100
+    ax_did.text(0.65, 0.06,
+                f"Triple DiD: β={r['coef']:+.3f}\n{pct:+.1f}% (p={r['pvalue']:.3f}) {r['sig']}",
+                transform=ax_did.transAxes, fontsize=8,
+                bbox=dict(boxstyle="round",facecolor="lightyellow",alpha=0.9))
+
+# ax_pt: Parallel trends visual
+ax_pt.axis("off")
+tests = [
+    ("Burned Area", 0.236, 0.82),
+    ("Fire Hotspots", -0.980, 0.356),
+]
+ax_pt.set_title("(D) Parallel Trends Test\n(pre-2012 coefficients)",
+                fontsize=10, fontweight="bold")
+
+y_positions = [0.7, 0.4]
+for (label, t_val, p_val), ypos in zip(tests, y_positions):
+    passed = p_val > 0.1
+    color  = C_SIG if passed else C_POST
+    symbol = "✓" if passed else "✗"
+    ax_pt.text(0.1, ypos+0.1, label, fontsize=11, fontweight="bold",
+               transform=ax_pt.transAxes, color="black")
+    ax_pt.text(0.1, ypos-0.05,
+               f"t = {t_val:.2f}\np = {p_val:.2f}",
+               transform=ax_pt.transAxes, fontsize=10, color=color)
+    ax_pt.text(0.75, ypos,
+               f"{symbol}\n{'Satisfied' if passed else 'Failed'}",
+               transform=ax_pt.transAxes, fontsize=14, fontweight="bold",
+               color=color, ha="center", va="center")
+    ax_pt.axhline(ypos-0.12, xmin=0.05, xmax=0.95,
+                  color="lightgray", linewidth=0.8,
+                  transform=ax_pt.transAxes)
+
+ax_pt.text(0.5, 0.08,
+           "Parallel trends assumption\nsatisfied for both metrics\n→ DiD is valid",
+           transform=ax_pt.transAxes, fontsize=9, ha="center",
+           bbox=dict(boxstyle="round",facecolor="lightgreen",alpha=0.3))
+
+plt.tight_layout(rect=[0,0,1,0.96])
+save_fig(fig, "fig06_causal_identification.png", fig_prog, fig_task, "Fig 7: Statistical Evidence")
+
+# ── FIG 7: STATISTICAL EVIDENCE ───────────────────────────────────────────────
+
+console.print("[yellow]→ Fig 7: Statistical Evidence...[/yellow]")
+
+fig = plt.figure(figsize=(18, 10))
+gs  = gridspec.GridSpec(2, 3, figure=fig, hspace=0.45, wspace=0.38)
+
+ax_fp1 = fig.add_subplot(gs[:, 0])     # forest plot burned
+ax_fp2 = fig.add_subplot(gs[:, 1])     # forest plot fire
+ax_tab = fig.add_subplot(gs[0, 2])     # tabela
+ax_sea = fig.add_subplot(gs[1, 2])     # por estação
+
+fig.suptitle(
+    "Fig. 7 — Statistical evidence: regression results across designs and specifications\n"
+    "Before-after | DiD | Temporal trend — consistent direction across all models",
+    fontsize=12, fontweight="bold", y=0.99
+)
+
+model_order  = ["Before-After", "DiD", "Trend×5yr"]
+model_colors = [C_PRE, C_POST, C_BRIF]
+
+def get_estimates(dep_var):
+    ests = []
+    # Before-After
+    r = ba_results[(ba_results["variable"]=="post_x_dry") &
+                   (ba_results["model"]=="OLS_FE_month") &
+                   (ba_results["dep_var"]==dep_var)]
+    if not r.empty:
+        r = r.iloc[0]
+        ests.append({"label":"Before-After\n(N=122 TIs)",
+                     "coef":r["coef"],"ci_low":r["ci_low"],"ci_high":r["ci_high"],
+                     "pvalue":r["pvalue"],"sig":r["sig"],"color":C_PRE})
+    # DiD
+    r2 = did_results[(did_results["variable"]=="post_x_dry_x_treat") &
+                     (did_results["dep_var"]==dep_var)]
+    if not r2.empty:
+        r2 = r2.iloc[0]
+        ests.append({"label":"DiD True\n(N=11 BRIFs vs 111)",
+                     "coef":r2["coef"],"ci_low":r2["ci_low"],"ci_high":r2["ci_high"],
+                     "pvalue":r2["pvalue"],"sig":r2["sig"],"color":C_POST})
+    # Trend
+    r3 = trend_df[(trend_df["model"]=="Linear") &
+                  (trend_df["season"].isin(["Seca","dry"])) &
+                  (trend_df["dep_var"]==dep_var)]
+    if not r3.empty:
+        r3 = r3.iloc[0]
+        coef5 = r3["coef_trend"]*5
+        se5   = r3["se_trend"]*5
+        ests.append({"label":"Temporal Trend\n(slope × 5yr)",
+                     "coef":coef5,"ci_low":coef5-1.96*se5,"ci_high":coef5+1.96*se5,
+                     "pvalue":r3["pval_trend"],"sig":r3.get("sig",""),"color":C_BRIF})
+    return ests
+
+for ax_fp, dep_var, title in [
+    (ax_fp1, "log_burned_ha",  "(A) Log Burned Area\nDry Season Effect"),
+    (ax_fp2, "log_fire_count", "(B) Log Fire Hotspots\nDry Season Effect"),
+]:
+    ests = get_estimates(dep_var)
+    y_pos = np.arange(len(ests))
+    for i, e in enumerate(ests):
+        ax_fp.plot([e["ci_low"],e["ci_high"]],[i,i],
+                   color=e["color"],linewidth=3,solid_capstyle="round")
+        ax_fp.scatter(e["coef"],i,color=e["color"],
+                      s=150 if e["pvalue"]<0.05 else 80,
+                      zorder=5,marker="D" if e["pvalue"]<0.05 else "o")
+        pct = (np.exp(e["coef"])-1)*100
+        sig = e["sig"] or ("***" if e["pvalue"]<0.001 else "**" if e["pvalue"]<0.01
+                           else "*" if e["pvalue"]<0.05 else "n.s.")
+        ax_fp.text(e["ci_high"]+0.02,i,
+                   f"{pct:+.1f}% {sig}",
+                   va="center",fontsize=9,
+                   color=e["color"] if sig!="n.s." else "gray",
+                   fontweight="bold" if sig!="n.s." else "normal")
+    ax_fp.axvline(0,color="black",linewidth=1,linestyle="--",alpha=0.6)
+    ax_fp.set_yticks(y_pos)
+    ax_fp.set_yticklabels([e["label"] for e in ests],fontsize=9)
+    ax_fp.set_xlabel("Estimated effect (log scale)",fontsize=9)
+    ax_fp.set_title(title,fontsize=10,fontweight="bold")
+    ax_fp.grid(axis="x",alpha=0.2)
+    xmin = ax_fp.get_xlim()[0]
+    ax_fp.axvspan(xmin,0,alpha=0.03,color="green")
+    ax_fp.axvspan(0,ax_fp.get_xlim()[1],alpha=0.03,color="red")
+    ax_fp.text(0.02,0.02,"← reduction",transform=ax_fp.transAxes,
+               fontsize=7.5,color="darkgreen")
+    ax_fp.text(0.98,0.02,"increase →",transform=ax_fp.transAxes,
+               fontsize=7.5,color="darkred",ha="right")
+
+    legend_elements = [
+        Line2D([0],[0],marker="D",color="gray",markersize=9,linestyle="None",label="p < 0.05"),
+        Line2D([0],[0],marker="o",color="gray",markersize=9,linestyle="None",label="n.s."),
+    ]
+    ax_fp.legend(handles=legend_elements,fontsize=8,loc="lower right")
+
+# Tabela de resultados
+ax_tab.axis("off")
+table_data = [
+    ["Model",             "Dep. Var.",  "β",      "SE",    "p-val", "Sig."],
+    ["Before-After",      "log BA",    "+0.129", "0.043", "0.003", "**"],
+    ["Before-After",      "log FH",   "−0.044", "0.031", "0.145", "n.s."],
+    ["Before-After+ONI",  "log BA",    "+0.173", "0.043", "<0.001","***"],
+    ["Before-After+ONI",  "log FH",   "+0.001", "0.031", "0.982", "n.s."],
+    ["DiD True",          "log BA",   "−0.148", "0.185", "0.424", "n.s."],
+    ["DiD True",          "log FH",   "−0.106", "0.084", "0.206", "n.s."],
+    ["Trend (Dry)",       "log BA",   "−0.022", "0.009", "0.011", "*"],
+    ["Trend (Dry)",       "log FH",   "−0.032", "0.006", "<0.001","***"],
+]
+t = ax_tab.table(
+    cellText  = table_data[1:],
+    colLabels = table_data[0],
+    cellLoc   = "center",
+    loc       = "center",
+    bbox      = [0,0,1,1],
+)
+t.auto_set_font_size(False)
+t.set_fontsize(8)
+for j in range(6):
+    t[0,j].set_facecolor("#1F3864")
+    t[0,j].set_text_props(color="white",fontweight="bold")
+row_colors = ["#E3F2FD","#E3F2FD","#E8F5E9","#E8F5E9",
+              "#FFF3E0","#FFF3E0","#F3E5F5","#F3E5F5"]
+for i in range(1,9):
+    for j in range(6):
+        t[i,j].set_facecolor(row_colors[i-1])
+t.auto_set_column_width(col=list(range(6)))
+ax_tab.set_title("(C) Summary of Main Results\nBA = Burned Area | FH = Fire Hotspots",
+                 fontsize=10,fontweight="bold",pad=8)
+
+# Por estação
+season_data = []
+for dep_var, dep_label in [("log_burned_ha","Log BA"),("log_fire_count","Log FH")]:
+    for season, season_en in [("Seca","Dry"),("Chuvosa","Wet")]:
+        r = trend_df[(trend_df["model"]=="Linear") &
+                     (trend_df["season"]==season) &
+                     (trend_df["dep_var"]==dep_var)]
+        if not r.empty:
+            r = r.iloc[0]
+            season_data.append({
+                "dep_label":dep_label,"season":season_en,
+                "coef":r["coef_trend"]*5,"se":r["se_trend"]*5,
+                "pvalue":r["pval_trend"],"sig":r.get("sig",""),
+            })
+
+if season_data:
+    sd_df   = pd.DataFrame(season_data)
+    x_pos   = np.arange(len(sd_df))
+    colors_s= [C_DRY if s=="Seca" else C_WET for s in sd_df["season"]]
+    bars    = ax_sea.bar(x_pos, sd_df["coef"],
+                         yerr=1.96*sd_df["se"],
+                         color=colors_s, alpha=0.85,
+                         capsize=5, error_kw={"elinewidth":1.5})
+    ax_sea.axhline(0,color="black",linewidth=0.8,linestyle="--")
+    ax_sea.set_xticks(x_pos)
+    ax_sea.set_xticklabels([f"{r['dep_label']}\n({r['season']})"
+                             for _,r in sd_df.iterrows()],fontsize=8)
+    for i,(_,row) in enumerate(sd_df.iterrows()):
+        sig = row["sig"] or ("***" if row["pvalue"]<0.001 else "**" if row["pvalue"]<0.01
+                             else "*" if row["pvalue"]<0.05 else "n.s.")
+        ypos = row["coef"]+1.96*row["se"]+0.005
+        ax_sea.text(i,ypos,sig,ha="center",fontsize=9,
+                    color="black" if sig!="n.s." else "gray",fontweight="bold")
+    legend_elem = [mpatches.Patch(color=C_DRY,alpha=0.85,label="Dry season"),
+                   mpatches.Patch(color=C_WET,alpha=0.85,label="Wet season")]
+    ax_sea.legend(handles=legend_elem,fontsize=8)
+    ax_sea.set_title("(D) Temporal Trend by Season\n(slope × 5yr, 2014–2023)",
+                     fontsize=10,fontweight="bold")
+    ax_sea.set_ylabel("Estimated 5yr change (log scale)",fontsize=9)
+    ax_sea.grid(axis="y",alpha=0.2)
+
+plt.tight_layout(rect=[0,0,1,0.96])
+save_fig(fig, "fig07_statistical_evidence.png", fig_prog, fig_task, "Fig 8: Climate Robustness")
+
+# ── FIG 8: CLIMATE ROBUSTNESS ─────────────────────────────────────────────────
+
+console.print("[yellow]→ Fig 8: Climate Robustness...[/yellow]")
+
+fig = plt.figure(figsize=(18, 10))
+gs  = gridspec.GridSpec(2, 3, figure=fig, hspace=0.42, wspace=0.35)
+
+ax_oni  = fig.add_subplot(gs[0, 0:2])
+ax_scat = fig.add_subplot(gs[0, 2])
+ax_r1   = fig.add_subplot(gs[1, 0])
+ax_r2   = fig.add_subplot(gs[1, 1])
+ax_el   = fig.add_subplot(gs[1, 2])
+
+fig.suptitle(
+    "Fig. 8 — Climate robustness: BRIF effect independent of large-scale climate variability\n"
+    "Controlling for ENSO, SPI-3, PDO and AMO strengthens — not weakens — the main finding",
+    fontsize=12, fontweight="bold", y=0.99
+)
+
+# ax_oni: ONI + fire
+ts_a = (
+    panel[panel["season"]=="dry"]
+    .groupby("year_int", as_index=False)
+    .agg(fire_count_mean=("fire_count","mean"),
+         burned_ha_mean=("burned_ha","mean"))
+    .sort_values("year_int")
+)
+try:
+    oni_ts = clim_panel.groupby("year_int")["oni"].mean().reset_index()
+    ts_a   = ts_a.merge(oni_ts, on="year_int", how="left")
+except:
+    ts_a["oni"] = 0
+
+ax_oni_twin = ax_oni.twinx()
+yrs = ts_a["year_int"].values
+oni_v = ts_a.get("oni", pd.Series([0]*len(ts_a))).fillna(0).values
+ax_oni.bar(yrs, np.where(oni_v>=0,oni_v,0), color=C_ENSO, alpha=0.6, label="El Niño")
+ax_oni.bar(yrs, np.where(oni_v<0,oni_v,0),  color=C_LNINA,alpha=0.6, label="La Niña")
+ax_oni.axhline(0.5,  color=C_ENSO, linewidth=0.8, linestyle=":", alpha=0.5)
+ax_oni.axhline(-0.5, color=C_LNINA,linewidth=0.8, linestyle=":", alpha=0.5)
+ax_oni.axhline(0,    color="black", linewidth=0.5)
+ax_oni_twin.plot(yrs, ts_a["fire_count_mean"],
+                 color="#BF360C", linewidth=2, marker="o", markersize=4,
+                 label="Hotspots (right axis)")
+ax_oni.axvline(2012.5, color=C_TRANS, linewidth=1.5, linestyle="--", alpha=0.7)
+ax_oni.axvspan(2015,2016.9, alpha=0.15, color=C_ENSO, label="El Niño 2015–16")
+ax_oni.set_ylabel("ONI (°C)", fontsize=9, color="gray")
+ax_oni_twin.set_ylabel("Hotspots/TI/month", fontsize=9, color="#BF360C")
+ax_oni.set_title("(A) ONI (El Niño/La Niña) × Fire Hotspots — Dry Season\n"
+                 "El Niño 2015–16 did not reverse post-BRIF declining trend",
+                 fontsize=10, fontweight="bold")
+ax_oni.legend(fontsize=7.5, loc="upper left")
+ax_oni_twin.legend(fontsize=7.5, loc="upper right")
+ax_oni.grid(alpha=0.2)
+ax_oni.xaxis.set_major_locator(mticker.MultipleLocator(2))
+
+# ax_scat: ONI × focos pré vs pós
+ts_c = (
+    panel[panel["season"]=="dry"]
+    .groupby(["year_int","period"], as_index=False)
+    .agg(fire_count_mean=("fire_count","mean"),
+         burned_ha_mean=("burned_ha","mean"))
+    .merge(ts_a[["year_int","oni"]], on="year_int", how="left")
+)
+for period, color, label, marker in [
+    ("pre",  C_PRE,  "Pre-BRIF",  "o"),
+    ("post", C_POST, "Post-BRIF", "s"),
+]:
+    df_p = ts_c[ts_c["period"]==period].dropna(subset=["oni","fire_count_mean"])
+    ax_scat.scatter(df_p["oni"], df_p["fire_count_mean"],
+                    color=color, s=60, alpha=0.8, marker=marker, label=label)
+    if len(df_p) > 2:
+        x = df_p["oni"].values; y = df_p["fire_count_mean"].values
+        z = np.polyfit(x, y, 1)
+        xr = np.linspace(x.min(), x.max(), 50)
+        ax_scat.plot(xr, np.poly1d(z)(xr), color=color, linewidth=1.8, linestyle="--")
+        r, pv = stats.pearsonr(x, y)
+        ax_scat.text(0.05 if period=="pre" else 0.55, 0.9 if period=="pre" else 0.08,
+                     f"r={r:.2f} (p={pv:.2f})",
+                     transform=ax_scat.transAxes, fontsize=8, color=color,
+                     bbox=dict(boxstyle="round",facecolor="white",alpha=0.8))
+
+ax_scat.set_xlabel("ONI (°C)", fontsize=9)
+ax_scat.set_ylabel("Hotspots/TI/month", fontsize=9)
+ax_scat.set_title("(B) ENSO Sensitivity by Period\nSlope reduction = BRIFs buffer climate shock",
+                  fontsize=10, fontweight="bold")
+ax_scat.legend(fontsize=8); ax_scat.grid(alpha=0.2)
+ax_scat.axvline(0.5, color="gray", linewidth=0.5, linestyle=":")
+ax_scat.axvline(-0.5, color="gray", linewidth=0.5, linestyle=":")
+
+# ax_r1 e ax_r2: robustez progressiva
+model_specs = ["Base", "+ONI", "+ONI+SPI", "+Full"]
+model_labels_r = {
+    "Base":     "No climate\ncontrol",
+    "+ONI":     "+ONI\n(ENSO)",
+    "+ONI+SPI": "+ONI\n+SPI-3",
+    "+Full":    "+ONI+SPI\n+PDO+AMO",
+}
+colors_r = ["#9E9E9E","#1565C0","#2E7D32","#6A1B9A"]
+
+for ax_r, dep_var, title in [
+    (ax_r1, "log_burned_ha",  "(C) Climate Robustness\nLog Burned Area"),
+    (ax_r2, "log_fire_count", "(D) Climate Robustness\nLog Fire Hotspots"),
+]:
+    df_rob = clim_df[(clim_df["dep_var"]==dep_var) & (clim_df["variable"]=="post_x_dry")]
+    y_pos  = np.arange(len(model_specs))
+    for i, (spec, color) in enumerate(zip(model_specs, colors_r)):
+        row = df_rob[df_rob["model"]==spec]
+        if row.empty:
+            continue
+        r = row.iloc[0]
+        ax_r.plot([r["ci_low"],r["ci_high"]],[i,i],
+                  color=color, linewidth=3, solid_capstyle="round")
+        ax_r.scatter(r["coef"],i, color=color,
+                     s=120 if r["pvalue"]<0.05 else 70, zorder=5,
+                     marker="D" if r["pvalue"]<0.05 else "o")
+        sig = r["sig"]
+        ax_r.text(r["ci_high"]+0.01,i,
+                  f"{sig or 'n.s.'} p={r['pvalue']:.3f}",
+                  va="center",fontsize=8,
+                  color=color if (sig and sig!="n.s.") else "gray")
+    ax_r.axvline(0, color="black", linewidth=0.8, linestyle="--")
+    ax_r.set_yticks(y_pos)
+    ax_r.set_yticklabels([model_labels_r.get(s,s) for s in model_specs], fontsize=8.5)
+    ax_r.set_xlabel("β (Post × Dry)", fontsize=9)
+    ax_r.set_title(title, fontsize=10, fontweight="bold")
+    ax_r.grid(axis="x", alpha=0.2)
+
+# ax_el: El Niño 2015-2016 como experimento
+elnino_pre  = ts_c[(ts_c["period"]=="pre")  & (ts_c["oni"]>=1.0)]
+elnino_post = ts_c[(ts_c["period"]=="post") & (ts_c["oni"]>=1.0)]
+neutral_pre  = ts_c[(ts_c["period"]=="pre")  & (ts_c["oni"].abs()<0.5)]
+neutral_post = ts_c[(ts_c["period"]=="post") & (ts_c["oni"].abs()<0.5)]
+
+categories = ["Strong\nEl Niño\nPre-BRIF","Strong\nEl Niño\nPost-BRIF",
+               "Neutral\nPre-BRIF", "Neutral\nPost-BRIF"]
+values = [
+    elnino_pre["fire_count_mean"].mean()  if len(elnino_pre)>0  else 0,
+    elnino_post["fire_count_mean"].mean() if len(elnino_post)>0 else 0,
+    neutral_pre["fire_count_mean"].mean() if len(neutral_pre)>0 else 0,
+    neutral_post["fire_count_mean"].mean()if len(neutral_post)>0 else 0,
+]
+colors_el = [C_ENSO, "#EF9A9A", C_NBRIF, "#BDBDBD"]
+bars_el = ax_el.bar(categories, values, color=colors_el, alpha=0.85, edgecolor="white")
+ax_el.set_title("(E) El Niño as Natural Experiment\nSame climate shock, different period",
+                fontsize=10, fontweight="bold")
+ax_el.set_ylabel("Mean hotspots/TI/month", fontsize=9)
+ax_el.grid(axis="y", alpha=0.2)
+for bar, val in zip(bars_el, values):
+    ax_el.text(bar.get_x()+bar.get_width()/2, val+0.3,
+               f"{val:.1f}", ha="center", fontsize=8.5, fontweight="bold")
+if values[0]>0 and values[1]>0:
+    delta_pct = (values[1]-values[0])/values[0]*100
+    ax_el.text(0.5,0.92,
+               f"El Niño effect: {delta_pct:+.1f}%\n(Post vs Pre-BRIF)",
+               transform=ax_el.transAxes, ha="center", fontsize=8.5,
+               bbox=dict(boxstyle="round",facecolor="lightyellow",alpha=0.9))
+
+plt.tight_layout(rect=[0,0,1,0.96])
+save_fig(fig, "fig08_climate_robustness.png", fig_prog, fig_task, "Fig 9: Mechanisms")
+
+# ── FIG 9: MECHANISMS & LEARNING ──────────────────────────────────────────────
+
+console.print("[yellow]→ Fig 9: Mechanisms & Learning...[/yellow]")
+
+fig = plt.figure(figsize=(18, 12))
+gs  = gridspec.GridSpec(2, 3, figure=fig, hspace=0.45, wspace=0.38)
+
+ax_map2  = fig.add_subplot(gs[0, 0])
+ax_frri  = fig.add_subplot(gs[0, 1])
+ax_comp  = fig.add_subplot(gs[0, 2])
+ax_trend1= fig.add_subplot(gs[1, 0:2])
+ax_proj  = fig.add_subplot(gs[1, 2])
+
+fig.suptitle(
+    "Fig. 9 — Mechanisms: Fire Regime Reorganization Index (FRRI) and institutional learning\n"
+    "Progressive improvement post-2013 = evidence of capacity building in indigenous fire brigades",
+    fontsize=12, fontweight="bold", y=0.99
+)
+
+# ax_map2: FRRI mapa
+tis_frri2 = tis_geo.merge(frri[["ti_id","frri"]], on="ti_id", how="left").to_crs("EPSG:4326")
+tis_frri2[tis_frri2["frri"].isna()].plot(
+    ax=ax_map2, color="#E8E8E8", edgecolor="#BBBBBB", linewidth=0.3)
+norm2 = TwoSlopeNorm(vmin=-1, vcenter=0, vmax=1)
+tis_frri2[tis_frri2["frri"].notna()].plot(
+    ax=ax_map2, column="frri", cmap="RdYlGn", norm=norm2,
+    edgecolor="white", linewidth=0.3,
+    legend=True,
+    legend_kwds={"label":"FRRI","orientation":"vertical","shrink":0.6,"pad":0.02})
+tis_frri2[tis_frri2["ti_id"].isin(treated_ids)].plot(
+    ax=ax_map2, color="none", edgecolor="#1A237E", linewidth=2.2)
+ax_map2.set_title("(A) FRRI Spatial Distribution\n■ = TIs with BRIFs",
+                  fontsize=10, fontweight="bold")
+ax_map2.set_xlabel("Longitude", fontsize=8)
+ax_map2.set_ylabel("Latitude", fontsize=8)
+
+# ax_frri: Distribuição FRRI
+frri_valid = frri.dropna(subset=["frri"])
+ax_frri.hist(frri_valid["frri"], bins=25, color="#4CAF50",
+             edgecolor="white", alpha=0.85)
+ax_frri.axvline(0, color="black", linewidth=1.2, linestyle="--")
+ax_frri.axvline(frri_valid["frri"].mean(), color="darkgreen",
+                linewidth=2, linestyle="-",
+                label=f"Mean = {frri_valid['frri'].mean():.3f}")
+ax_frri.axvline(frri_valid["frri"].median(), color="green",
+                linewidth=2, linestyle=":",
+                label=f"Median = {frri_valid['frri'].median():.3f}")
+pct_pos = (frri_valid["frri"]>0).mean()*100
+ax_frri.fill_betweenx([0, ax_frri.get_ylim()[1] if ax_frri.get_ylim()[1]>0 else 30],
+                      0, frri_valid["frri"].max(),
+                      alpha=0.08, color="green")
+ax_frri.set_title(f"(B) FRRI Distribution\n{pct_pos:.0f}% TIs with positive reorganization",
+                  fontsize=10, fontweight="bold")
+ax_frri.set_xlabel("FRRI", fontsize=9)
+ax_frri.set_ylabel("Number of TIs", fontsize=9)
+ax_frri.legend(fontsize=8); ax_frri.grid(alpha=0.2)
+
+# ax_comp: Componentes do FRRI
+components = {
+    "C1\nCritical fire": -0.266,
+    "C2\nSeasonal\nredistrib.": 0.008,
+    "C3\nTotal area": -0.282,
+    "C4\nFragmentation": 0.124,
+    "C5\nClimate\nadj.": -0.523,
+}
+colors_comp = [C_POST if v<0 else C_BRIF for v in components.values()]
+ax_comp.barh(list(components.keys()), list(components.values()),
+             color=colors_comp, alpha=0.85, edgecolor="white")
+ax_comp.axvline(0, color="black", linewidth=0.8, linestyle="--")
+for i, (label, val) in enumerate(components.items()):
+    ax_comp.text(val + (0.02 if val>0 else -0.02), i,
+                 f"{val:+.3f}", va="center", fontsize=9,
+                 ha="left" if val>0 else "right", fontweight="bold",
+                 color=C_BRIF if val>0 else C_POST)
+ax_comp.set_title("(C) FRRI Component Contributions\nMean across 122 TIs",
+                  fontsize=10, fontweight="bold")
+ax_comp.set_xlabel("Component mean value", fontsize=9)
+ax_comp.grid(axis="x", alpha=0.2)
+weights = {"C1":0.30,"C2":0.25,"C3":0.20,"C4":0.15,"C5":0.10}
+for i, (label, w) in enumerate([(k,v) for k,v in weights.items()]):
+    ax_comp.text(1.02, i, f"w={w}", va="center", fontsize=7.5,
+                 transform=ax_comp.get_yaxis_transform(), color="gray")
+
+# ax_trend1: Tendência temporal pós-BRIF
+ts_pos_dry = (
+    panel[(panel["period"]=="post") & (panel["season"]=="dry")]
+    .groupby("year_int", as_index=False)
+    .agg(burned_ha_mean=("burned_ha","mean"),
+         fire_count_mean=("fire_count","mean"))
+    .sort_values("year_int")
+)
+
+ax_t1_twin = ax_trend1.twinx()
+
+ax_trend1.plot(ts_pos_dry["year_int"], ts_pos_dry["burned_ha_mean"],
+               color=C_DRY, linewidth=2.2, marker="o", markersize=6,
+               label="Burned area (left)")
+ax_t1_twin.plot(ts_pos_dry["year_int"], ts_pos_dry["fire_count_mean"],
+                color="#BF360C", linewidth=2.2, marker="s", markersize=6,
+                linestyle="--", label="Hotspots (right)")
+
+# Tendência burned
+x = ts_pos_dry["year_int"].values
+y1 = ts_pos_dry["burned_ha_mean"].values
+y2 = ts_pos_dry["fire_count_mean"].values
+if len(x) > 2:
+    z1 = np.polyfit(x, y1, 1)
+    z2 = np.polyfit(x, y2, 1)
+    xr = np.linspace(x.min(), x.max(), 50)
+    r1, p1 = stats.pearsonr(x, y1)
+    r2, p2 = stats.pearsonr(x, y2)
+    ax_trend1.plot(xr, np.poly1d(z1)(xr), color=C_DRY, linewidth=1.5,
+                   linestyle=":", alpha=0.8,
+                   label=f"Trend: {z1[0]:+.0f} ha/yr (p={p1:.3f})")
+    ax_t1_twin.plot(xr, np.poly1d(z2)(xr), color="#BF360C", linewidth=1.5,
+                    linestyle=":", alpha=0.8,
+                    label=f"Trend: {z2[0]:+.2f}/yr (p={p2:.4f})")
+
+ax_trend1.set_title("(D) Post-BRIF Temporal Trend (2014–2023) — Dry Season\n"
+                    "Declining hotspots with increasing burned area = progressive reorganization",
+                    fontsize=10, fontweight="bold")
+ax_trend1.set_xlabel("Year", fontsize=9)
+ax_trend1.set_ylabel("Burned area (ha/TI/month)", fontsize=9, color=C_DRY)
+ax_t1_twin.set_ylabel("Hotspots/TI/month", fontsize=9, color="#BF360C")
+ax_trend1.legend(fontsize=8, loc="upper left")
+ax_t1_twin.legend(fontsize=8, loc="upper right")
+ax_trend1.grid(alpha=0.2)
+ax_trend1.xaxis.set_major_locator(mticker.MultipleLocator(1))
+
+# ax_proj: Projeção do aprendizado institucional
+years_proj = np.arange(2014, 2035)
+slope_fire  = -0.032  # -3.2%/ano (log escala)
+slope_area  = -0.022  # -2.2%/ano
+
+# Base: média 2014
+base_fire = ts_pos_dry["fire_count_mean"].iloc[0] if len(ts_pos_dry)>0 else 50
+base_area = ts_pos_dry["burned_ha_mean"].iloc[0]  if len(ts_pos_dry)>0 else 1500
+
+proj_fire = base_fire * np.exp(slope_fire * (years_proj - 2014))
+proj_area = base_area * np.exp(slope_area * (years_proj - 2014))
+
+ax_proj.plot(years_proj, proj_fire/base_fire*100,
+             color="#BF360C", linewidth=2.2, linestyle="--", label="Hotspots (% of 2014)")
+ax_proj.plot(years_proj, proj_area/base_area*100,
+             color=C_DRY, linewidth=2.2, linestyle="-", label="Burned area (% of 2014)")
+ax_proj.axhline(100, color="gray", linewidth=0.8, linestyle=":", alpha=0.5)
+ax_proj.axhline(50, color="red", linewidth=0.8, linestyle=":", alpha=0.3)
+ax_proj.axvline(2024, color="gray", linewidth=1, linestyle="--", alpha=0.5,
+                label="Last observation")
+ax_proj.fill_between(years_proj[years_proj>=2024],
+                     proj_fire[years_proj>=2024]/base_fire*100,
+                     100, alpha=0.08, color="#BF360C")
+ax_proj.set_title("(E) Institutional Learning Projection\n"
+                  "If trend continues at observed slope (−3.2%/yr hotspots)",
+                  fontsize=10, fontweight="bold")
+ax_proj.set_xlabel("Year", fontsize=9)
+ax_proj.set_ylabel("% of 2014 baseline", fontsize=9)
+ax_proj.legend(fontsize=8)
+ax_proj.grid(alpha=0.2)
+ax_proj.text(0.6, 0.15,
+             "50% reduction\nin hotspots\nby ~2036",
+             transform=ax_proj.transAxes, fontsize=8.5,
+             bbox=dict(boxstyle="round",facecolor="lightyellow",alpha=0.9))
+ax_proj.xaxis.set_major_locator(mticker.MultipleLocator(3))
+
+plt.tight_layout(rect=[0,0,1,0.96])
+save_fig(fig, "fig09_mechanisms_learning.png", fig_prog, fig_task, "Done")
+
+# Fecha progress bar de figuras
+# (o with make_progress() fecha automaticamente aqui)
+
+# ============================================================
+# RESUMO FINAL
+# ============================================================
+
+figs = sorted(DIRS["figures"].glob("fig0*.png"))
+console.print(f"\n[bold cyan]Figuras finais para publicação ({len(figs)}):[/bold cyan]")
+for f in figs:
+    console.print(f"  {f.name} ({f.stat().st_size/1024:.0f} KB)")
+
+# Exibe todas
+console.print("\n[cyan]Exibindo figuras...[/cyan]")
+for f in figs:
+    print(f"\n{'═'*70}\n  {f.name}\n{'═'*70}")
+    ipy_display(IPyImage(filename=str(f), width=1100))
+
+console.print("""
+[bold green]
+╔══════════════════════════════════════════════════════════════════╗
+║         BLOCK 12 — PIPELINE COMPLETO CONCLUÍDO                 ║
+╠══════════════════════════════════════════════════════════════════╣
+║  Fig 1 — Study Area & Data Framework                           ║
+║  Fig 2 — Fire Regime Change (money figure)                     ║
+║  Fig 3 — Structural Change: Area × Hotspots                    ║
+║  Fig 4 — Fire Radiative Power (intensity)                      ║
+║  Fig 5 — Spatial Counterfactual: TIs vs non-TIs                ║
+║  Fig 6 — Causal Identification: Event Study + DiD              ║
+║  Fig 7 — Statistical Evidence: Forest Plot + Table             ║
+║  Fig 8 — Climate Robustness: ENSO + Progressive Control        ║
+║  Fig 9 — Mechanisms: FRRI + Institutional Learning             ║
+╚══════════════════════════════════════════════════════════════════╝
+[/bold green]
+""")

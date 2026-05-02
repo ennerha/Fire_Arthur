@@ -1,0 +1,484 @@
+# ============================================================
+# BLOCK 2 — MapBiomas Fogo: área queimada mensal por Terra Indígena
+#
+# Abordagem definitiva:
+#   - Geometrias ORIGINAIS (não bbox) — essencial para 30m
+#   - Upload do GeoJSON das TIs para EE Asset via ee.data API
+#   - Se upload falhar: processa em lotes de 5 TIs por task
+#   - Export Tasks paralelas por ano → Drive API → parquet
+#
+# Decodificação: pixel = MMcc → mês = floor(valor / 100)
+# ============================================================
+
+import time
+import io
+import json
+import tempfile
+from pathlib import Path
+from googleapiclient.discovery import build
+from googleapiclient.http import MediaIoBaseDownload
+from google.colab import auth
+
+# ============================================================
+# 1. PARÂMETROS
+# ============================================================
+
+MAPBIOMAS_ASSET  = "projects/mapbiomas-public/assets/brazil/fire/collection3/mapbiomas_fire_collection3_monthly_burned_coverage_v1"
+MAPBIOMAS_SCALE  = 30
+EE_TILE_SCALE    = 8       # maior = menos memória por tile
+PIXEL_AREA_HA    = 0.09    # 30m × 30m = 0.09 ha
+
+TASK_PREFIX      = "mbfire"
+EE_EXPORT_FOLDER = f"{PROJECT_NAME}/07_exports/mapbiomas_fire"
+MONITOR_INTERVAL = 60
+MONITOR_TIMEOUT  = 18000   # 5h
+
+EXPORT_LOCAL_DIR = DIRS["exports"] / "mapbiomas_fire"
+EXPORT_LOCAL_DIR.mkdir(parents=True, exist_ok=True)
+
+FIRE_END_YEAR    = min(END_YEAR, 2023)
+EE_ASSET_TIS     = f"projects/{EE_PROJECT}/assets/study_tis_cerrado"
+
+# ============================================================
+# 2. OBTÉM OU CRIA FEATURECOLLECTION COM GEOMETRIAS ORIGINAIS
+# ============================================================
+
+def get_tis_fc() -> ee.FeatureCollection:
+    """
+    Tenta carregar as TIs do EE Asset (geometrias originais).
+    Se não existir, usa bboxes como fallback mas avisa.
+    """
+    # Tenta asset
+    try:
+        fc = ee.FeatureCollection(EE_ASSET_TIS)
+        n  = fc.size().getInfo()
+        if n > 0:
+            console.print(f"[green]✓ TIs carregadas do EE Asset ({n} TIs — geometrias originais)[/green]")
+            return fc
+    except Exception:
+        pass
+
+    # Tenta fazer upload do GeoJSON para o asset
+    console.print("[yellow]→ Asset não encontrado. Tentando upload das geometrias...[/yellow]")
+    try:
+        return upload_and_get_fc()
+    except Exception as e:
+        console.print(f"[yellow]⚠ Upload falhou: {e}[/yellow]")
+
+    # Fallback: geometrias simplificadas (não bbox — usa simplify)
+    console.print("[yellow]→ Usando geometrias simplificadas (tolerância 100m)...[/yellow]")
+    return build_simplified_fc(tolerance=100)
+
+
+def upload_and_get_fc() -> ee.FeatureCollection:
+    """Faz upload do GeoJSON para EE Asset e retorna FeatureCollection."""
+    import subprocess, shutil
+
+    geojson_src = DIRS["boundaries"] / "study_tis_cerrado.geojson"
+    geojson_tmp = Path("/tmp/tis_cerrado.geojson")
+    shutil.copy2(geojson_src, geojson_tmp)
+
+    # Garante pasta no asset
+    asset_folder = "/".join(EE_ASSET_TIS.split("/")[:-1])
+    try:
+        ee.data.createAsset({"type": "Folder"}, opt_path=asset_folder)
+    except Exception:
+        pass  # já existe
+
+    # Tenta CLI com projeto
+    cmd = [
+        "earthengine", "--project", EE_PROJECT,
+        "upload", "table",
+        f"--asset_id={EE_ASSET_TIS}",
+        str(geojson_tmp),
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+    output = (result.stdout + result.stderr).strip()
+    console.print(f"[dim]{output[:200]}[/dim]")
+
+    if result.returncode != 0:
+        raise RuntimeError(f"CLI upload falhou: {output[:200]}")
+
+    # Aguarda ingestion
+    console.print("[yellow]→ Aguardando ingestion do asset...[/yellow]")
+    for i in range(40):
+        time.sleep(15)
+        try:
+            fc = ee.FeatureCollection(EE_ASSET_TIS)
+            n  = fc.size().getInfo()
+            if n > 0:
+                console.print(f"[green]✓ Asset disponível: {n} TIs[/green]")
+                return fc
+        except Exception:
+            pass
+        if (i+1) % 4 == 0:
+            console.print(f"  [dim]{(i+1)*15}s...[/dim]")
+
+    raise TimeoutError("Asset não ficou disponível em 10 min.")
+
+
+def build_simplified_fc(tolerance: int = 100) -> ee.FeatureCollection:
+    """
+    Geometrias simplificadas em lotes — muito menor que bbox,
+    preserva forma da TI.
+    """
+    features = []
+    for _, row in tis.iterrows():
+        geom_json = json.loads(
+            gpd.GeoSeries([row.geometry], crs="EPSG:4326").to_json()
+        )["features"][0]["geometry"]
+        ee_geom = ee.Geometry(geom_json).simplify(maxError=tolerance)
+        features.append(ee.Feature(ee_geom, {
+            "ti_id":    int(row["ti_id"]),
+            "ti_name":  str(row["ti_name"]),
+            "area_ha":  float(row["area_ha"]),
+            "area_km2": float(row["area_km2"]),
+        }))
+
+    # Envia em lotes de 10
+    batches = [features[i:i+10] for i in range(0, len(features), 10)]
+    fc = ee.FeatureCollection([ee.FeatureCollection(b) for b in batches]).flatten()
+    n  = fc.size().getInfo()
+    console.print(f"[green]✓ FeatureCollection: {n} TIs (geometrias simplificadas {tolerance}m)[/green]")
+    return fc
+
+# ============================================================
+# 3. TASKS ATIVAS NO EE
+# ============================================================
+
+def get_active_task_descriptions() -> set:
+    """Retorna descrições de tasks RUNNING ou READY."""
+    try:
+        tasks = ee.data.getTaskList()
+        return {
+            t["description"]
+            for t in tasks
+            if t.get("state") in ("RUNNING", "READY")
+            and t.get("description", "").startswith(TASK_PREFIX)
+        }
+    except Exception:
+        return set()
+
+# ============================================================
+# 4. EXPORT TASKS POR ANO
+# ============================================================
+
+def launch_tasks(tis_fc, years_needed: list) -> list:
+    """Dispara uma task por ano. Pula se CSV local ou task ativa."""
+    img          = ee.Image(MAPBIOMAS_ASSET)
+    active_descs = get_active_task_descriptions()
+    launched     = []
+
+    for year in years_needed:
+        desc = f"{TASK_PREFIX}_{year}"
+        dest = EXPORT_LOCAL_DIR / f"{desc}.csv"
+
+        if dest.exists():
+            console.print(f"[cyan]✓ CSV já existe: {dest.name}[/cyan]")
+            continue
+        if desc in active_descs:
+            console.print(f"[cyan]✓ Task já ativa: {desc}[/cyan]")
+            launched.append(year)
+            continue
+
+        band = f"burned_coverage_{year}"
+        month_fcs = []
+
+        for month in range(1, 13):
+            burned = (img.select(band)
+                         .divide(100).floor().toInt()
+                         .eq(month)
+                         .selfMask()
+                         .rename("burned_pixels"))
+
+            reduced = burned.reduceRegions(
+                collection = tis_fc,
+                reducer    = ee.Reducer.sum().setOutputs(["burned_pixels"]),
+                scale      = MAPBIOMAS_SCALE,
+                tileScale  = EE_TILE_SCALE,
+            ).map(lambda f: f
+                .set("year",  year)
+                .set("month", month)
+                .select(["ti_id", "ti_name", "area_ha", "area_km2",
+                         "year", "month", "burned_pixels"])
+            )
+            month_fcs.append(reduced)
+
+        task = ee.batch.Export.table.toDrive(
+            collection     = ee.FeatureCollection(month_fcs).flatten(),
+            description    = desc,
+            folder         = EE_EXPORT_FOLDER,
+            fileNamePrefix = desc,
+            fileFormat     = "CSV",
+        )
+        task.start()
+        launched.append(year)
+        console.print(f"[yellow]→ Task disparada: {desc}[/yellow]")
+        time.sleep(0.5)
+
+    return launched
+
+# ============================================================
+# 5. MONITORA
+# ============================================================
+
+def monitor(years_pending: list) -> dict:
+    if not years_pending:
+        return {}
+
+    pending = set(years_pending)
+    done    = {}
+    t0      = time.time()
+
+    console.print(f"[cyan]Monitorando {len(pending)} tasks...[/cyan]")
+    console.print(f"[dim]https://code.earthengine.google.com/tasks[/dim]")
+
+    while pending:
+        try:
+            all_tasks = ee.data.getTaskList()
+            for t in all_tasks:
+                desc  = t.get("description", "")
+                state = t.get("state", "")
+                if not desc.startswith(TASK_PREFIX):
+                    continue
+                try:
+                    yr = int(desc.replace(f"{TASK_PREFIX}_", ""))
+                except ValueError:
+                    continue
+                if yr not in pending:
+                    continue
+                if state == "COMPLETED":
+                    done[yr] = "COMPLETED"
+                    pending.discard(yr)
+                    console.print(f"  [green]✓ {yr}: COMPLETED[/green]")
+                elif state in ("FAILED", "CANCELLED"):
+                    done[yr] = state
+                    pending.discard(yr)
+                    console.print(f"  [red]✗ {yr}: {state}[/red]")
+        except Exception as e:
+            console.print(f"[yellow]⚠ Erro ao verificar: {e}[/yellow]")
+
+        if not pending:
+            break
+
+        if time.time() - t0 > MONITOR_TIMEOUT:
+            for yr in pending:
+                done[yr] = "TIMEOUT"
+            console.print(f"[red]⚠ Timeout. Pendentes: {sorted(pending)}[/red]")
+            break
+
+        n_done = len(done)
+        console.print(
+            f"  [dim]{n_done}/{n_done+len(pending)} | "
+            f"{len(pending)} pendentes | {MONITOR_INTERVAL}s...[/dim]"
+        )
+        time.sleep(MONITOR_INTERVAL)
+
+    ok  = sum(1 for s in done.values() if s == "COMPLETED")
+    bad = [y for y, s in done.items() if s != "COMPLETED"]
+    console.print(f"[bold]Resultado: {ok} OK | {len(bad)} problema(s)[/bold]")
+    if bad:
+        save_json({"failed": bad}, DIRS["logs"] / "burned_failed_tasks.json")
+    return done
+
+# ============================================================
+# 6. DOWNLOAD VIA DRIVE API
+# ============================================================
+
+def download_csvs(years: list) -> dict:
+    auth.authenticate_user()
+    svc        = build("drive", "v3", cache_discovery=False)
+    downloaded = {}
+
+    console.print("[yellow]→ Baixando CSVs via Drive API...[/yellow]")
+
+    for year in years:
+        filename = f"{TASK_PREFIX}_{year}.csv"
+        dest     = EXPORT_LOCAL_DIR / filename
+
+        if dest.exists():
+            console.print(f"  [cyan]✓ Já existe: {filename}[/cyan]")
+            downloaded[year] = dest
+            continue
+
+        results = svc.files().list(
+            q      = f"name='{filename}' and mimeType='text/csv' and trashed=false",
+            spaces = "drive",
+            fields = "files(id, name)",
+        ).execute()
+
+        files = results.get("files", [])
+        if not files:
+            console.print(f"  [yellow]⚠ Não encontrado: {filename}[/yellow]")
+            continue
+
+        file_id = files[0]["id"]
+        request    = svc.files().get_media(fileId=file_id)
+        buf        = io.BytesIO()
+        downloader = MediaIoBaseDownload(buf, request)
+        done_dl    = False
+        while not done_dl:
+            _, done_dl = downloader.next_chunk()
+
+        dest.write_bytes(buf.getvalue())
+        downloaded[year] = dest
+        console.print(f"  [green]✓ {filename}[/green]")
+
+    console.print(f"[green]✓ {len(downloaded)}/{len(years)} CSVs.[/green]")
+    return downloaded
+
+# ============================================================
+# 7. CONSOLIDA
+# ============================================================
+
+def consolidate(csv_paths: list) -> pd.DataFrame:
+    dfs = []
+    for p in sorted(csv_paths):
+        df_tmp = pd.read_csv(p)
+        dfs.append(df_tmp)
+        console.print(f"  [dim]{Path(p).name}: {len(df_tmp):,} linhas[/dim]")
+
+    df = pd.concat(dfs, ignore_index=True)
+
+    if "sum" in df.columns and "burned_pixels" not in df.columns:
+        df = df.rename(columns={"sum": "burned_pixels"})
+
+    drop = [c for c in df.columns if c.startswith("system:") or c in (".geo", "geo")]
+    df   = df.drop(columns=drop, errors="ignore")
+
+    df["year"]          = pd.to_numeric(df["year"],          errors="coerce").astype("Int64")
+    df["month"]         = pd.to_numeric(df["month"],         errors="coerce").astype("Int64")
+    df["ti_id"]         = pd.to_numeric(df["ti_id"],         errors="coerce").astype("Int64")
+    df["burned_pixels"] = pd.to_numeric(df["burned_pixels"], errors="coerce").fillna(0)
+    df["area_ha"]       = pd.to_numeric(df["area_ha"],       errors="coerce")
+    df["burned_ha"]     = (df["burned_pixels"] * PIXEL_AREA_HA).round(2)
+    df["burned_pct"]    = ((df["burned_ha"] / df["area_ha"]) * 100).round(4).clip(0, 100)
+
+    df = add_time_fields(df)
+    df = df[df["period"] != "outside"].copy()
+    df = df.sort_values(["ti_id", "year", "month"]).reset_index(drop=True)
+    return df
+
+# ============================================================
+# 8. PIPELINE
+# ============================================================
+
+def run_burned_pipeline() -> pd.DataFrame:
+
+    console.print("\n[bold cyan]— Etapa 1: FeatureCollection (geometrias originais) —[/bold cyan]")
+    tis_fc = get_tis_fc()
+
+    console.print("\n[bold cyan]— Etapa 2: Anos necessários —[/bold cyan]")
+    all_years    = list(range(START_YEAR, FIRE_END_YEAR + 1))
+    years_done   = [y for y in all_years
+                    if (EXPORT_LOCAL_DIR / f"{TASK_PREFIX}_{y}.csv").exists()]
+    years_needed = [y for y in all_years if y not in years_done]
+
+    console.print(f"  Com CSV: {len(years_done)} | A processar: {len(years_needed)}")
+
+    if years_needed:
+        console.print("\n[bold cyan]— Etapa 3: Export Tasks —[/bold cyan]")
+        launched = launch_tasks(tis_fc, years_needed)
+
+        console.print("\n[bold cyan]— Etapa 4: Monitoramento —[/bold cyan]")
+        monitor(launched)
+
+        console.print("\n[bold cyan]— Etapa 5: Download —[/bold cyan]")
+        download_csvs(years_needed)
+
+    console.print("\n[bold cyan]— Etapa 6: Consolidando —[/bold cyan]")
+    csv_paths = sorted(EXPORT_LOCAL_DIR.glob(f"{TASK_PREFIX}_*.csv"))
+
+    if not csv_paths:
+        raise RuntimeError(
+            "Nenhum CSV disponível.\n"
+            "Verifique: https://code.earthengine.google.com/tasks"
+        )
+
+    df = consolidate(csv_paths)
+
+    # Validação sazonal
+    dry = df[df["dry"] == 1]["burned_ha"].sum()
+    wet = df[df["dry"] == 0]["burned_ha"].sum()
+    ratio = dry / wet if wet > 0 else 0
+    if ratio > 1:
+        console.print(f"[green]✓ Sazonal OK: seca {dry:,.0f} ha > chuva {wet:,.0f} ha (ratio {ratio:.2f})[/green]")
+    else:
+        console.print(f"[red]⚠ Sazonal invertido: seca {dry:,.0f} ha / chuva {wet:,.0f} ha[/red]")
+        console.print("[yellow]  Possível causa: geometrias bbox capturando áreas agrícolas externas.[/yellow]")
+
+    console.print(f"[green]✓ {len(df):,} registros.[/green]")
+    return df
+
+# ============================================================
+# 9. EXECUTA
+# ============================================================
+
+# Limpa CSVs antigos (prefixo diferente) apenas se não há CSVs novos ainda
+new_csvs = list(EXPORT_LOCAL_DIR.glob("mbfire_*.csv"))
+old_csvs = list(EXPORT_LOCAL_DIR.glob("mapbiomas_fire_*.csv"))
+if old_csvs and not new_csvs:
+    console.print(f"[yellow]→ Removendo {len(old_csvs)} CSVs antigos (prefixo mapbiomas_fire_)...[/yellow]")
+    for f in old_csvs:
+        f.unlink()
+elif old_csvs and new_csvs:
+    console.print(f"[cyan]→ CSVs novos já existem ({len(new_csvs)}), mantendo. Removendo antigos...[/cyan]")
+    for f in old_csvs:
+        f.unlink()
+
+burned_monthly = checkpoint_load_or_run(
+    name  = "burned_monthly_by_ti",
+    func  = run_burned_pipeline,
+    ext   = "parquet",
+    force = FORCE_REPROCESS,
+)
+
+# ============================================================
+# 10. SALVA E SUMÁRIOS
+# ============================================================
+
+burned_monthly.to_csv(    DIRS["tables"] / "burned_monthly_by_ti.csv",     index=False)
+burned_monthly.to_parquet(DIRS["tables"] / "burned_monthly_by_ti.parquet", index=False)
+
+n_years   = FIRE_END_YEAR - START_YEAR + 1
+expected  = len(tis) * n_years * 12
+actual    = len(burned_monthly)
+console.print(f"\n[cyan]Cobertura:[/cyan] {actual:,} / {expected:,} ({actual/expected*100:.1f}%)")
+console.print(f"[cyan]Área total:[/cyan] {burned_monthly['burned_ha'].sum():,.0f} ha")
+
+summary_season = (
+    burned_monthly
+    .groupby(["period", "season"], as_index=False)
+    .agg(n=("burned_ha","count"), total_ha=("burned_ha","sum"),
+         media_ha=("burned_ha","mean"), mediana_ha=("burned_ha","median"),
+         dp_ha=("burned_ha","std"), media_pct=("burned_pct","mean"))
+    .round(2)
+)
+
+summary_anual = (
+    burned_monthly
+    .groupby(["year","period"], as_index=False)
+    .agg(total_ha=("burned_ha","sum"), media_mensal=("burned_ha","mean"),
+         media_pct=("burned_pct","mean"))
+    .round(2)
+)
+
+summary_mensal = (
+    burned_monthly
+    .groupby(["month","season"], as_index=False)
+    .agg(media_ha=("burned_ha","mean"), media_pct=("burned_pct","mean"))
+    .round(2)
+)
+
+summary_season.to_csv( DIRS["stats"] / "summary_burned_period_season.csv", index=False)
+summary_anual.to_csv(  DIRS["stats"] / "summary_burned_anual.csv",         index=False)
+summary_mensal.to_csv( DIRS["stats"] / "summary_burned_mensal.csv",        index=False)
+
+console.print(f"[green]✓ CSV:[/green]     {DIRS['tables'] / 'burned_monthly_by_ti.csv'}")
+console.print(f"[green]✓ Parquet:[/green] {DIRS['tables'] / 'burned_monthly_by_ti.parquet'}")
+console.print(f"[green]✓ Sumários:[/green] {DIRS['stats']}")
+display(summary_season)
+display(summary_mensal)
+
+console.print("[bold green]✓ BLOCK 2 concluído com sucesso.[/bold green]")
+

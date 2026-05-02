@@ -1,0 +1,159 @@
+# ============================================================
+# BLOCK 4 — Painel final: TI × mês
+#
+# Join de todos os dados coletados:
+#   - CHIRPS (precipitação)
+#   - MapBiomas Fogo (área queimada)
+#   - Focos MODIS (hotspots)
+#
+# Saída:
+#   03_tables/panel_ti_month.parquet / .csv
+# ============================================================
+
+# ============================================================
+# 1. CARREGA DADOS DOS BLOCOS ANTERIORES
+# ============================================================
+
+def load_table(name, ext="parquet"):
+    p = DIRS["tables"] / f"{name}.{ext}"
+    if p.exists():
+        return pd.read_parquet(p) if ext == "parquet" else pd.read_csv(p)
+    p2 = cache_path(name, ext)
+    if p2.exists():
+        return read_table(p2)
+    raise FileNotFoundError(f"Tabela não encontrada: {name}")
+
+console.print("[cyan]Carregando dados dos blocos anteriores...[/cyan]")
+
+chirps   = load_table("chirps_monthly_by_ti")
+burned   = load_table("burned_monthly_by_ti")
+hotspots = load_table("hotspots_monthly_by_ti")
+
+console.print(f"  CHIRPS:   {len(chirps):,} registros")
+console.print(f"  Queimada: {len(burned):,} registros")
+console.print(f"  Focos:    {len(hotspots):,} registros")
+
+# ============================================================
+# 2. CHAVES DE JOIN
+# ============================================================
+
+JOIN_KEYS = ["ti_id", "year", "month"]
+
+# Garante tipos consistentes
+for df in [chirps, burned, hotspots]:
+    df["ti_id"] = pd.to_numeric(df["ti_id"], errors="coerce").astype("Int64")
+    df["year"]  = pd.to_numeric(df["year"],  errors="coerce").astype("Int64")
+    df["month"] = pd.to_numeric(df["month"], errors="coerce").astype("Int64")
+
+# ============================================================
+# 3. CONSTRÓI O PAINEL BASE (CHIRPS como espinha)
+# ============================================================
+
+# CHIRPS cobre 2001–2024, burned cobre 2001–2023
+# O painel usa a interseção temporal + outer para preservar dados
+
+panel = chirps[JOIN_KEYS + ["ti_name", "area_ha", "area_km2", "precip_mm",
+                             "period", "season", "post", "dry", "post_x_dry", "date"]].copy()
+
+# Join com área queimada
+burned_cols = ["burned_pixels", "burned_ha", "burned_pct"]
+burned_cols = [c for c in burned_cols if c in burned.columns]
+panel = panel.merge(
+    burned[JOIN_KEYS + burned_cols],
+    on=JOIN_KEYS,
+    how="left",
+)
+
+# Join com focos
+hotspot_cols = ["fire_count", "fire_density"]
+hotspot_cols = [c for c in hotspot_cols if c in hotspots.columns]
+panel = panel.merge(
+    hotspots[JOIN_KEYS + hotspot_cols],
+    on=JOIN_KEYS,
+    how="left",
+)
+
+# ============================================================
+# 4. PREENCHE VALORES AUSENTES
+# ============================================================
+
+# Área queimada: 0 para meses fora do range do MapBiomas (2024)
+for col in burned_cols:
+    panel[col] = panel[col].fillna(0)
+
+# Focos: 0 onde não há detecção
+for col in hotspot_cols:
+    panel[col] = panel[col].fillna(0)
+
+# ============================================================
+# 5. VARIÁVEIS DERIVADAS
+# ============================================================
+
+# Proporção do fogo na estação seca vs total anual (por TI-ano)
+annual_fire = (
+    panel.groupby(["ti_id", "year"])
+    .agg(
+        burned_ha_anual  = ("burned_ha",  "sum"),
+        fire_count_anual = ("fire_count", "sum"),
+    )
+    .reset_index()
+)
+
+panel = panel.merge(annual_fire, on=["ti_id", "year"], how="left")
+
+# Proporção do fogo que ocorreu na seca (vs total do ano)
+panel["burned_ha_dry_frac"] = np.where(
+    panel["burned_ha_anual"] > 0,
+    (panel["burned_ha"] * panel["dry"]) / panel["burned_ha_anual"],
+    np.nan
+)
+
+panel["fire_count_dry_frac"] = np.where(
+    panel["fire_count_anual"] > 0,
+    (panel["fire_count"] * panel["dry"]) / panel["fire_count_anual"],
+    np.nan
+)
+
+# Log das variáveis de fogo (para modelos)
+panel["log_burned_ha"]  = np.log1p(panel["burned_ha"])
+panel["log_fire_count"] = np.log1p(panel["fire_count"])
+panel["log_precip"]     = np.log1p(panel["precip_mm"])
+
+# Anomalia de precipitação por TI (desvio da média histórica)
+precip_mean = panel.groupby("ti_id")["precip_mm"].transform("mean")
+precip_std  = panel.groupby("ti_id")["precip_mm"].transform("std")
+panel["precip_anomaly"] = ((panel["precip_mm"] - precip_mean) / precip_std).round(4)
+
+# ============================================================
+# 6. ORDENA E VALIDA
+# ============================================================
+
+panel = panel.sort_values(["ti_id", "year", "month"]).reset_index(drop=True)
+
+# Relatório de cobertura
+n_ti    = panel["ti_id"].nunique()
+n_month = panel.groupby("ti_id").size().mean()
+console.print(f"\n[cyan]Painel construído:[/cyan]")
+console.print(f"  TIs:              {n_ti}")
+console.print(f"  Registros totais: {len(panel):,}")
+console.print(f"  Média meses/TI:   {n_month:.0f}")
+console.print(f"  Colunas:          {list(panel.columns)}")
+console.print(f"  Período:          {panel['year'].min()}–{panel['year'].max()}")
+
+# ============================================================
+# 7. SALVA
+# ============================================================
+
+panel.to_parquet(DIRS["tables"] / "panel_ti_month.parquet", index=False)
+panel.to_csv(    DIRS["tables"] / "panel_ti_month.csv",     index=False)
+
+console.print(f"\n[green]✓ Parquet:[/green] {DIRS['tables'] / 'panel_ti_month.parquet'}")
+console.print(f"[green]✓ CSV:[/green]     {DIRS['tables'] / 'panel_ti_month.csv'}")
+
+# ============================================================
+# 8. SUMÁRIO DO PAINEL
+# ============================================================
+
+display(panel.describe(include="all").T[["count", "mean", "std", "min", "max"]].round(2))
+
+console.print("[bold green]✓ BLOCK 4 concluído com sucesso.[/bold green]")

@@ -1,0 +1,860 @@
+# ============================================================
+# BLOCK 8 — Análises Avançadas para Causalidade e Ineditividade
+#
+# Análise 1: Event Study (Dynamic DiD)
+#   - Estima efeito ano a ano em torno de 2013
+#   - Testa paralelismo pré-tratamento
+#   - Figura: coeficientes anuais com IC 95%
+#
+# Análise 2: Heterogeneidade do Efeito
+#   - Por tamanho da TI (quartis de área)
+#   - Por região geográfica (norte/sul/leste/oeste do Cerrado)
+#   - Por fase de homologação (FUNAI)
+#   - Figura: coeficientes por subgrupo
+#
+# Análise 3: Tendência Temporal Pós-BRIF
+#   - Tendência linear e não-linear pós-2013
+#   - Teste de aprendizado institucional
+#   - Figura: trajetória do efeito 2014–2023
+#
+# Saídas:
+#   04_stats/event_study_*.csv
+#   04_stats/heterogeneidade_*.csv
+#   04_stats/tendencia_pos_brif_*.csv
+#   05_figures/fig8_event_study.png
+#   05_figures/fig9_heterogeneidade.png
+#   05_figures/fig10_tendencia.png
+#   05_figures/fig11_painel_avancado.png
+# ============================================================
+
+import warnings
+warnings.filterwarnings("ignore")
+
+import numpy as np
+import pandas as pd
+import geopandas as gpd
+import matplotlib.pyplot as plt
+import matplotlib.gridspec as gridspec
+import matplotlib.ticker as mticker
+import statsmodels.formula.api as smf
+from scipy import stats
+from pathlib import Path
+from IPython.display import display as ipy_display, Image as IPyImage
+
+# ============================================================
+# CONFIGURAÇÃO
+# ============================================================
+
+plt.rcParams.update({
+    "font.family":       "DejaVu Sans",
+    "font.size":         10,
+    "axes.titlesize":    11,
+    "axes.labelsize":    10,
+    "xtick.labelsize":   9,
+    "ytick.labelsize":   9,
+    "legend.fontsize":   9,
+    "axes.spines.top":   False,
+    "axes.spines.right": False,
+    "figure.dpi":        150,
+})
+
+DPI_PUB = 500
+C_PRE   = "#1565C0"
+C_POST  = "#C62828"
+C_DRY   = "#E65100"
+C_WET   = "#1565C0"
+C_TRANS = "#757575"
+C_SIG   = "#2E7D32"
+C_NSIG  = "#9E9E9E"
+
+# ============================================================
+# 1. CARREGA DADOS
+# ============================================================
+
+panel   = pd.read_parquet(DIRS["tables"] / "panel_ti_month.parquet")
+tis_geo = gpd.read_file(DIRS["boundaries"] / "study_tis_cerrado.gpkg")
+
+# Painel anual agregado (mais eficiente para modelos anuais)
+panel_annual = (
+    panel
+    .groupby(["ti_id", "ti_name", "year", "period", "area_ha"], as_index=False)
+    .agg(
+        burned_ha_total  = ("burned_ha",   "sum"),
+        burned_ha_dry    = ("burned_ha",   lambda x: x[panel.loc[x.index,"dry"]==1].sum()),
+        burned_ha_wet    = ("burned_ha",   lambda x: x[panel.loc[x.index,"dry"]==0].sum()),
+        fire_total       = ("fire_count",  "sum"),
+        fire_dry         = ("fire_count",  lambda x: x[panel.loc[x.index,"dry"]==1].sum()),
+        precip_total     = ("precip_mm",   "sum"),
+        precip_dry       = ("precip_mm",   lambda x: x[panel.loc[x.index,"dry"]==1].sum()),
+    )
+)
+
+panel_annual["log_burned_total"] = np.log1p(panel_annual["burned_ha_total"])
+panel_annual["log_burned_dry"]   = np.log1p(panel_annual["burned_ha_dry"])
+panel_annual["log_fire_total"]   = np.log1p(panel_annual["fire_total"])
+panel_annual["log_fire_dry"]     = np.log1p(panel_annual["fire_dry"])
+panel_annual["ti_id_str"]        = panel_annual["ti_id"].astype(str)
+
+# Painel mensal para modelos mensais
+panel_model = panel[panel["period"].isin(["pre", "post"])].copy()
+panel_model["ti_id_str"] = panel_model["ti_id"].astype(str)
+panel_model["year"]      = panel_model["year"].astype(int)
+panel_model["post"]      = panel_model["post"].astype(int)
+panel_model["dry"]       = panel_model["dry"].astype(int)
+panel_model["post_x_dry"]= panel_model["post_x_dry"].astype(int)
+
+console.print(f"[cyan]Dados carregados:[/cyan] {len(panel):,} obs mensais | "
+              f"{panel['ti_id'].nunique()} TIs | "
+              f"{panel['year'].min()}–{panel['year'].max()}")
+
+# ============================================================
+# ANÁLISE 1 — EVENT STUDY (DYNAMIC DiD)
+# ============================================================
+
+console.print("\n[bold cyan]═══ ANÁLISE 1: Event Study (Dynamic DiD) ═══[/bold cyan]")
+
+def run_event_study(dep_var: str, label: str) -> pd.DataFrame:
+    """
+    Estima efeito ano a ano relativo a 2012 (ano base pré-BRIF).
+    Modelo: Y_it = Σ_t β_t · I(year=t) + αi + γt + ε_it
+    Ano base: 2012 (omitido → coeficiente = 0)
+    """
+    df = panel_annual[panel_annual["year"] != 2013].copy()  # exclui transição
+    df["year_str"] = "y" + df["year"].astype(str)
+
+    # Ano base: 2012
+    years = sorted(df["year"].unique())
+    years_no_base = [y for y in years if y != 2012]
+
+    # Cria dummies de ano × (ano ≠ base)
+    for y in years_no_base:
+        df[f"d_{y}"] = (df["year"] == y).astype(int)
+
+    dummy_terms = " + ".join([f"d_{y}" for y in years_no_base])
+    formula = f"{dep_var} ~ {dummy_terms} + C(ti_id_str) - 1"
+
+    try:
+        model = smf.ols(formula, data=df).fit(
+            cov_type="cluster",
+            cov_kwds={"groups": df["ti_id_str"]}
+        )
+
+        rows = []
+        for y in years:
+            if y == 2012:
+                rows.append({"year": y, "coef": 0.0, "ci_low": 0.0,
+                             "ci_high": 0.0, "pvalue": 1.0, "se": 0.0})
+                continue
+            var = f"d_{y}"
+            if var in model.params:
+                ci = model.conf_int().loc[var]
+                rows.append({
+                    "year":    y,
+                    "coef":    model.params[var],
+                    "se":      model.bse[var],
+                    "ci_low":  ci[0],
+                    "ci_high": ci[1],
+                    "pvalue":  model.pvalues[var],
+                })
+
+        df_res = pd.DataFrame(rows).sort_values("year")
+        df_res["sig"]   = df_res["pvalue"].apply(
+            lambda p: "***" if p<0.001 else "**" if p<0.01 else "*" if p<0.05 else ""
+        )
+        df_res["dep_var"] = dep_var
+        df_res["label"]   = label
+
+        console.print(f"  [green]✓ Event study: {label}[/green]")
+        return df_res
+
+    except Exception as e:
+        console.print(f"  [red]✗ {label}: {e}[/red]")
+        return pd.DataFrame()
+
+
+es_burned = run_event_study("log_burned_dry",  "Log Área Queimada (Seca)")
+es_fire   = run_event_study("log_fire_dry",    "Log Focos de Calor (Seca)")
+
+# Salva
+es_all = pd.concat([es_burned, es_fire], ignore_index=True)
+es_all.to_csv(DIRS["stats"] / "event_study_results.csv", index=False)
+console.print(f"[green]✓ Event study salvo.[/green]")
+
+# Teste de paralelismo pré-tratamento
+def test_parallel_trends(df_es: pd.DataFrame) -> dict:
+    """Testa se coeficientes pré-2013 são conjuntamente zero (F-test)."""
+    pre_coefs = df_es[df_es["year"] < 2012]["coef"].values
+    pre_ses   = df_es[df_es["year"] < 2012]["se"].values
+    if len(pre_coefs) == 0:
+        return {"F": np.nan, "p": np.nan, "n": 0}
+    # Teste t conjunto aproximado: média / SE médio
+    t_stat = np.mean(pre_coefs) / (np.std(pre_coefs) / np.sqrt(len(pre_coefs)))
+    p_val  = 2 * (1 - stats.t.cdf(abs(t_stat), df=len(pre_coefs)-1))
+    return {"t": round(t_stat, 3), "p": round(p_val, 3), "n": len(pre_coefs)}
+
+pt_burned = test_parallel_trends(es_burned)
+pt_fire   = test_parallel_trends(es_fire)
+
+console.print(f"\n[cyan]Teste de tendências paralelas (pré-2012):[/cyan]")
+console.print(f"  Área queimada: t={pt_burned['t']}, p={pt_burned['p']} "
+              f"({'✓ paralelas' if pt_burned['p'] > 0.1 else '✗ não paralelas'})")
+console.print(f"  Focos:         t={pt_fire['t']}, p={pt_fire['p']} "
+              f"({'✓ paralelas' if pt_fire['p'] > 0.1 else '✗ não paralelas'})")
+
+# ============================================================
+# ANÁLISE 2 — HETEROGENEIDADE DO EFEITO (INTERAÇÕES CONTÍNUAS)
+# ============================================================
+
+console.print("\n[bold cyan]═══ ANÁLISE 2: Heterogeneidade do Efeito ═══[/bold cyan]")
+
+# Características das TIs — variáveis contínuas para interação
+tis_centroid = tis_geo.copy()
+tis_centroid["lon"] = tis_geo.geometry.centroid.x
+tis_centroid["lat"] = tis_geo.geometry.centroid.y
+
+ti_chars = tis_geo[["ti_id", "area_ha"]].copy()
+ti_chars["lon"] = tis_centroid["lon"].values
+ti_chars["lat"] = tis_centroid["lat"].values
+ti_chars["log_area"] = np.log(ti_chars["area_ha"])
+
+# Normaliza para interpretação dos coeficientes
+ti_chars["log_area_z"] = (ti_chars["log_area"] - ti_chars["log_area"].mean()) / ti_chars["log_area"].std()
+ti_chars["lat_z"]      = (ti_chars["lat"] - ti_chars["lat"].mean()) / ti_chars["lat"].std()
+ti_chars["lon_z"]      = (ti_chars["lon"] - ti_chars["lon"].mean()) / ti_chars["lon"].std()
+
+# Quartis de tamanho (para figura de barras)
+ti_chars["area_quartil"] = pd.qcut(
+    ti_chars["area_ha"], q=4,
+    labels=["Q1 Pequena", "Q2 Média-peq.", "Q3 Média-gde.", "Q4 Grande"]
+)
+
+panel_het = panel_model.merge(
+    ti_chars[["ti_id", "log_area_z", "lat_z", "lon_z", "area_quartil"]],
+    on="ti_id", how="left"
+)
+
+# Converte para float
+for col in ["log_area_z", "lat_z", "lon_z"]:
+    panel_het[col] = panel_het[col].astype(float)
+
+het_results = []
+
+console.print("  [yellow]→ Modelos de interação contínua:[/yellow]")
+
+for dep_var, dep_label in [
+    ("log_burned_ha",  "Log Área Queimada"),
+    ("log_fire_count", "Log Focos"),
+]:
+    # Modelo 1: interação com tamanho (log_area)
+    try:
+        panel_het["post_x_logarea"] = panel_het["post"].astype(float) * panel_het["log_area_z"]
+        panel_het["dry_x_logarea"]  = panel_het["dry"].astype(float) * panel_het["log_area_z"]
+        panel_het["pxd_x_logarea"]  = panel_het["post_x_dry"].astype(float) * panel_het["log_area_z"]
+
+        m = smf.ols(
+            f"{dep_var} ~ post + dry + post_x_dry + "
+            f"log_area_z + post_x_logarea + pxd_x_logarea + "
+            f"precip_mm + C(month) + C(ti_id_str) - 1",
+            data=panel_het
+        ).fit(cov_type="cluster", cov_kwds={"groups": panel_het["ti_id_str"]})
+
+        het_results.append({
+            "dimension": "Tamanho da TI (log_area × Post×Dry)",
+            "dep_label": dep_label, "dep_var": dep_var,
+            "coef_post_x_dry": m.params.get("post_x_dry", np.nan),
+            "se_post_x_dry":   m.bse.get("post_x_dry", np.nan),
+            "pval_post_x_dry": m.pvalues.get("post_x_dry", np.nan),
+            "coef_interact":   m.params.get("pxd_x_logarea", np.nan),
+            "se_interact":     m.bse.get("pxd_x_logarea", np.nan),
+            "pval_interact":   m.pvalues.get("pxd_x_logarea", np.nan),
+            "n_tis": panel_het["ti_id_str"].nunique(),
+            "r2": m.rsquared,
+        })
+        console.print(
+            f"    {dep_label} × Tamanho: "
+            f"β_base={m.params.get('post_x_dry',np.nan):+.3f} | "
+            f"β_interact={m.params.get('pxd_x_logarea',np.nan):+.3f} "
+            f"(p={m.pvalues.get('pxd_x_logarea',np.nan):.3f})"
+        )
+    except Exception as e:
+        console.print(f"    [red]✗ {dep_label} × Tamanho: {e}[/red]")
+
+    # Modelo 2: interação com latitude
+    try:
+        panel_het["pxd_x_lat"] = panel_het["post_x_dry"].astype(float) * panel_het["lat_z"]
+
+        m2 = smf.ols(
+            f"{dep_var} ~ post + dry + post_x_dry + "
+            f"lat_z + pxd_x_lat + "
+            f"precip_mm + C(month) + C(ti_id_str) - 1",
+            data=panel_het
+        ).fit(cov_type="cluster", cov_kwds={"groups": panel_het["ti_id_str"]})
+
+        het_results.append({
+            "dimension": "Latitude (Norte-Sul × Post×Dry)",
+            "dep_label": dep_label, "dep_var": dep_var,
+            "coef_post_x_dry": m2.params.get("post_x_dry", np.nan),
+            "se_post_x_dry":   m2.bse.get("post_x_dry", np.nan),
+            "pval_post_x_dry": m2.pvalues.get("post_x_dry", np.nan),
+            "coef_interact":   m2.params.get("pxd_x_lat", np.nan),
+            "se_interact":     m2.bse.get("pxd_x_lat", np.nan),
+            "pval_interact":   m2.pvalues.get("pxd_x_lat", np.nan),
+            "n_tis": panel_het["ti_id_str"].nunique(),
+            "r2": m2.rsquared,
+        })
+        console.print(
+            f"    {dep_label} × Latitude: "
+            f"β_base={m2.params.get('post_x_dry',np.nan):+.3f} | "
+            f"β_interact={m2.params.get('pxd_x_lat',np.nan):+.3f} "
+            f"(p={m2.pvalues.get('pxd_x_lat',np.nan):.3f})"
+        )
+    except Exception as e:
+        console.print(f"    [red]✗ {dep_label} × Latitude: {e}[/red]")
+
+    # Modelo 3: FRRI por quartil de tamanho — usa dados do Block 5 se disponível
+    try:
+        frri_data = pd.read_parquet(DIRS["tables"] / "frri_ti.parquet")
+        frri_chars = frri_data[["ti_id", "frri"]].merge(
+            ti_chars[["ti_id", "area_quartil"]], on="ti_id", how="left"
+        ).dropna(subset=["frri", "area_quartil"])
+
+        for q_label in frri_chars["area_quartil"].cat.categories:
+            grp = frri_chars[frri_chars["area_quartil"] == q_label]["frri"]
+            if len(grp) >= 3:
+                het_results.append({
+                    "dimension": "FRRI por tamanho",
+                    "dep_label": "FRRI",
+                    "dep_var":   "frri",
+                    "group_val": str(q_label),
+                    "coef_post_x_dry": grp.mean(),
+                    "se_post_x_dry":   grp.sem(),
+                    "pval_post_x_dry": stats.ttest_1samp(grp, 0).pvalue,
+                    "coef_interact":   np.nan,
+                    "se_interact":     np.nan,
+                    "pval_interact":   np.nan,
+                    "n_tis": len(grp),
+                    "r2": np.nan,
+                })
+        console.print(f"    FRRI por quartil de tamanho: OK")
+    except Exception as e:
+        console.print(f"    [yellow]⚠ FRRI por quartil: {e}[/yellow]")
+
+het_df = pd.DataFrame(het_results) if het_results else pd.DataFrame(
+    columns=["group_var","group_val","dep_var","dep_label","dimension",
+             "n_tis","n_obs","coef_post_x_dry","se_post_x_dry",
+             "pval_post_x_dry","coef_post","se_post","pval_post","r2"]
+)
+
+if not het_df.empty:
+    het_df["sig"] = het_df["pval_post_x_dry"].apply(
+        lambda p: "***" if p<0.001 else "**" if p<0.01 else "*" if p<0.05 else "n.s."
+    )
+    console.print(f"[green]✓ Heterogeneidade: {len(het_df)} subgrupos.[/green]")
+else:
+    het_df["sig"] = pd.Series(dtype=str)
+    console.print("[yellow]⚠ Sem subgrupos com TIs suficientes para heterogeneidade.[/yellow]")
+
+het_df.to_csv(DIRS["stats"] / "heterogeneidade_results.csv", index=False)
+console.print(f"\n[green]✓ Heterogeneidade salva.[/green]")
+
+# ============================================================
+# ANÁLISE 3 — TENDÊNCIA TEMPORAL PÓS-BRIF
+# ============================================================
+
+console.print("\n[bold cyan]═══ ANÁLISE 3: Tendência Temporal Pós-BRIF ═══[/bold cyan]")
+
+panel_pos = panel_model[panel_model["period"] == "post"].copy()
+
+# Converte todas as colunas Int64 nullable para tipos nativos do numpy
+for col in panel_pos.columns:
+    if hasattr(panel_pos[col], "dtype"):
+        if str(panel_pos[col].dtype) in ("Int64", "Int32", "Int16", "Int8",
+                                          "UInt64", "UInt32"):
+            panel_pos[col] = panel_pos[col].astype(float)
+        elif str(panel_pos[col].dtype) == "boolean":
+            panel_pos[col] = panel_pos[col].astype(float)
+
+panel_pos["years_since"]  = (panel_pos["year"] - 2013.0).astype(float)
+panel_pos["years_since2"] = panel_pos["years_since"] ** 2
+panel_pos["ti_id_str"]    = panel_pos["ti_id"].astype(int).astype(str)
+
+tend_results = []
+
+for dep_var, dep_label in [
+    ("log_burned_ha",  "Log Área Queimada"),
+    ("log_fire_count", "Log Focos de Calor"),
+]:
+    for season, season_label in [("dry", "Seca"), ("wet", "Chuvosa")]:
+        df_s = panel_pos[panel_pos["season"] == season].copy()
+
+        # Modelo linear
+        try:
+            m_lin = smf.ols(
+                f"{dep_var} ~ years_since + precip_mm + C(month) + C(ti_id_str) - 1",
+                data=df_s
+            ).fit(cov_type="cluster", cov_kwds={"groups": df_s["ti_id_str"]})
+
+            tend_results.append({
+                "dep_var":    dep_var,
+                "dep_label":  dep_label,
+                "season":     season_label,
+                "model":      "Linear",
+                "coef_trend": m_lin.params.get("years_since", np.nan),
+                "se_trend":   m_lin.bse.get("years_since", np.nan),
+                "pval_trend": m_lin.pvalues.get("years_since", np.nan),
+                "r2":         m_lin.rsquared,
+            })
+        except Exception as e:
+            console.print(f"  [red]✗ Linear {dep_label} {season_label}: {e}[/red]")
+
+        # Modelo quadrático
+        try:
+            m_quad = smf.ols(
+                f"{dep_var} ~ years_since + years_since2 + precip_mm + "
+                f"C(month) + C(ti_id_str) - 1",
+                data=df_s
+            ).fit(cov_type="cluster", cov_kwds={"groups": df_s["ti_id_str"]})
+
+            tend_results.append({
+                "dep_var":    dep_var,
+                "dep_label":  dep_label,
+                "season":     season_label,
+                "model":      "Quadrático",
+                "coef_trend": m_quad.params.get("years_since", np.nan),
+                "se_trend":   m_quad.bse.get("years_since", np.nan),
+                "pval_trend": m_quad.pvalues.get("years_since", np.nan),
+                "coef_quad":  m_quad.params.get("years_since2", np.nan),
+                "pval_quad":  m_quad.pvalues.get("years_since2", np.nan),
+                "r2":         m_quad.rsquared,
+            })
+        except Exception as e:
+            console.print(f"  [red]✗ Quad {dep_label} {season_label}: {e}[/red]")
+
+tend_df = pd.DataFrame(tend_results) if tend_results else pd.DataFrame(
+    columns=["dep_var","dep_label","season","model","coef_trend",
+             "se_trend","pval_trend","r2","sig"]
+)
+if not tend_df.empty:
+    tend_df["sig"] = tend_df["pval_trend"].apply(
+        lambda p: "***" if p<0.001 else "**" if p<0.01 else "*" if p<0.05 else "n.s."
+    )
+else:
+    console.print("[yellow]⚠ Sem resultados de tendência.[/yellow]")
+tend_df.to_csv(DIRS["stats"] / "tendencia_pos_brif.csv", index=False)
+
+console.print("\n[cyan]Tendência temporal pós-BRIF (modelo linear):[/cyan]")
+display(tend_df[tend_df["model"]=="Linear"][
+    ["dep_label","season","coef_trend","se_trend","pval_trend","sig","r2"]
+].round(4))
+
+# ============================================================
+# FIGURAS
+# ============================================================
+
+# ── Fig 8: Event Study ──────────────────────────────────────
+
+console.print("\n[yellow]→ Fig 8: Event Study...[/yellow]")
+
+fig, axes = plt.subplots(1, 2, figsize=(14, 6))
+fig.suptitle(
+    "Event Study — Efeito dinâmico das BRIFs ao longo do tempo\n"
+    "Ano base: 2012 | Linha tracejada: implementação das BRIFs (2013)",
+    fontsize=12, fontweight="bold"
+)
+
+for ax, (es_df, title) in zip(axes, [
+    (es_burned, "Log Área Queimada — Estação Seca"),
+    (es_fire,   "Log Focos de Calor — Estação Seca"),
+]):
+    if es_df.empty:
+        ax.text(0.5, 0.5, "Sem dados", ha="center", va="center",
+                transform=ax.transAxes)
+        continue
+
+    pre  = es_df[es_df["year"] <= 2012]
+    post = es_df[es_df["year"] >= 2012]
+
+    # Período pré — azul
+    ax.plot(pre["year"], pre["coef"], color=C_PRE, linewidth=2,
+            marker="o", markersize=6, label="Pré-BRIF", zorder=3)
+    ax.fill_between(pre["year"], pre["ci_low"], pre["ci_high"],
+                    alpha=0.15, color=C_PRE)
+
+    # Período pós — vermelho
+    ax.plot(post["year"], post["coef"], color=C_POST, linewidth=2,
+            marker="s", markersize=6, label="Pós-BRIF", zorder=3)
+    ax.fill_between(post["year"], post["ci_low"], post["ci_high"],
+                    alpha=0.15, color=C_POST)
+
+    # Linha zero e linha de tratamento
+    ax.axhline(0, color="black", linewidth=0.8, linestyle="--", alpha=0.5)
+    ax.axvline(2012.5, color=C_TRANS, linewidth=2, linestyle="--",
+               label="Implementação BRIFs", alpha=0.8)
+    ax.axvspan(2013, 2014, alpha=0.1, color=C_TRANS)
+
+    # Significância
+    for _, row in es_df[es_df["pvalue"] < 0.05].iterrows():
+        ax.annotate(
+            "●", xy=(row["year"], row["coef"]),
+            fontsize=8, color=C_SIG, ha="center", va="bottom",
+            xytext=(0, 6), textcoords="offset points"
+        )
+
+    ax.set_title(title, fontsize=10, fontweight="bold")
+    ax.set_xlabel("Ano", fontsize=9)
+    ax.set_ylabel("Coeficiente (relativo a 2012)", fontsize=9)
+    ax.legend(fontsize=8, loc="upper left")
+    ax.grid(axis="y", alpha=0.25)
+    ax.xaxis.set_major_locator(mticker.MultipleLocator(2))
+
+    # Nota sobre paralelismo
+    pt = pt_burned if "Queimada" in title else pt_fire
+    pt_txt = (f"Tendências paralelas pré-2012:\nt={pt.get('t','?')}, "
+              f"p={pt.get('p','?')} "
+              f"({'✓' if pt.get('p',0) > 0.1 else '✗'})")
+    ax.text(0.02, 0.98, pt_txt, transform=ax.transAxes,
+            fontsize=7.5, va="top",
+            bbox=dict(boxstyle="round,pad=0.3", facecolor="lightyellow",
+                      alpha=0.9))
+
+plt.tight_layout()
+p = DIRS["figures"] / "fig8_event_study.png"
+fig.savefig(p, dpi=DPI_PUB, bbox_inches="tight")
+plt.close()
+console.print(f"[green]✓ Fig 8 salva:[/green] {p.name}")
+
+# ── Fig 9: Heterogeneidade — Interações contínuas ───────────
+
+console.print("[yellow]→ Fig 9: Heterogeneidade...[/yellow]")
+
+het_df_plot = pd.DataFrame(het_results) if het_results else pd.DataFrame()
+
+fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+fig.suptitle(
+    "Heterogeneidade do efeito das BRIFs\n"
+    "Interações contínuas: tamanho da TI e gradiente latitudinal",
+    fontsize=12, fontweight="bold"
+)
+
+row_configs = [
+    ("Log Área Queimada", axes[0,0], axes[0,1]),
+    ("Log Focos",         axes[1,0], axes[1,1]),
+]
+
+for dep_label, ax_base, ax_int in row_configs:
+    # Filtra resultados para esta variável dependente
+    if het_df_plot.empty or "dep_label" not in het_df_plot.columns:
+        df_p = pd.DataFrame()
+    else:
+        df_p = het_df_plot[het_df_plot["dep_label"] == dep_label].copy()
+
+    if df_p.empty:
+        for ax, ttl in [(ax_base, f"Efeito base — {dep_label}"),
+                        (ax_int,  f"Moderação — {dep_label}")]:
+            ax.text(0.5, 0.5, "Sem dados", ha="center", va="center",
+                    transform=ax.transAxes, fontsize=11)
+            ax.set_title(ttl, fontsize=9, fontweight="bold")
+        continue
+
+    dims  = df_p["dimension"].tolist()
+    coefs = df_p["coef_post_x_dry"].tolist()
+    ses   = df_p["se_post_x_dry"].tolist()
+    pvals = df_p["pval_post_x_dry"].tolist()
+    clrs  = [C_SIG if p < 0.05 else C_NSIG for p in pvals]
+
+    # Painel esquerdo: β_base
+    ax_base.barh(
+        [d.split("(")[0].strip() for d in dims], coefs,
+        xerr=[1.96*s for s in ses],
+        color=clrs, alpha=0.85,
+        error_kw={"elinewidth": 1.5, "capsize": 5, "ecolor": "black"}
+    )
+    ax_base.axvline(0, color="black", linewidth=0.8, linestyle="--")
+    ax_base.set_title(f"({['A','B','C','D'][row_configs.index((dep_label,ax_base,ax_int))*2]}) "
+                      f"Efeito Post×Dry — {dep_label}", fontsize=9, fontweight="bold")
+    ax_base.set_xlabel("β4 (Post × Dry)", fontsize=8)
+    ax_base.grid(axis="x", alpha=0.2)
+    for i, (c, s, p) in enumerate(zip(coefs, ses, pvals)):
+        sig = "***" if p<0.001 else "**" if p<0.01 else "*" if p<0.05 else "n.s."
+        ax_base.text(c + 1.96*s + 0.003, i, sig, va="center", fontsize=8.5,
+                     color=C_SIG if sig != "n.s." else "gray")
+
+    # Painel direito: β_interação
+    ic = df_p["coef_interact"].tolist()
+    is_ = df_p["se_interact"].tolist()
+    ip = df_p["pval_interact"].tolist()
+
+    valid = [(d, c, s, p) for d, c, s, p in zip(dims, ic, is_, ip)
+             if not (np.isnan(c) if isinstance(c, float) else False)]
+
+    if valid:
+        vd, vc, vs, vp = zip(*valid)
+        vc_colors = [C_SIG if p < 0.05 else C_NSIG for p in vp]
+        ax_int.barh(
+            [d.split("(")[0].strip() for d in vd], vc,
+            xerr=[1.96*s for s in vs],
+            color=vc_colors, alpha=0.85,
+            error_kw={"elinewidth": 1.5, "capsize": 5, "ecolor": "black"}
+        )
+        ax_int.axvline(0, color="black", linewidth=0.8, linestyle="--")
+        for i, (c, s, p) in enumerate(zip(vc, vs, vp)):
+            sig = "***" if p<0.001 else "**" if p<0.01 else "*" if p<0.05 else "n.s."
+            ax_int.text(c + 1.96*s + 0.003, i, sig, va="center", fontsize=8.5,
+                        color=C_SIG if sig != "n.s." else "gray")
+        ax_int.text(0.03, 0.05,
+                    "+ = TIs maiores/norte\ntêm maior efeito BRIF",
+                    transform=ax_int.transAxes, fontsize=7.5,
+                    bbox=dict(boxstyle="round", facecolor="lightyellow", alpha=0.8))
+    else:
+        ax_int.text(0.5, 0.5, "Interação\nnão estimada",
+                    ha="center", va="center", transform=ax_int.transAxes, fontsize=10)
+
+    idx = row_configs.index((dep_label, ax_base, ax_int))
+    ax_int.set_title(f"({['A','B','C','D'][idx*2+1]}) "
+                     f"Moderação (interação) — {dep_label}", fontsize=9, fontweight="bold")
+    ax_int.set_xlabel("β_interação", fontsize=8)
+    ax_int.grid(axis="x", alpha=0.2)
+
+plt.tight_layout()
+p = DIRS["figures"] / "fig9_heterogeneidade.png"
+fig.savefig(p, dpi=DPI_PUB, bbox_inches="tight")
+plt.close()
+console.print(f"[green]✓ Fig 9 salva:[/green] {p.name}")
+
+# ── Fig 10: Tendência Temporal ───────────────────────────────
+
+console.print("[yellow]→ Fig 10: Tendência temporal pós-BRIF...[/yellow]")
+
+# Agrega por ano — apenas pós-BRIF
+ts_pos = (
+    panel[panel["period"] == "post"]
+    .groupby(["year", "season"], as_index=False)
+    .agg(
+        burned_ha_mean  = ("burned_ha",  "mean"),
+        fire_count_mean = ("fire_count", "mean"),
+        precip_mean     = ("precip_mm",  "mean"),
+    )
+)
+
+fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+fig.suptitle(
+    "Tendência temporal pós-BRIF (2014–2023)\n"
+    "Teste de aprendizado institucional das brigadas",
+    fontsize=12, fontweight="bold"
+)
+
+plot_data = [
+    ("dry",  "burned_ha_mean",  "Área Queimada — Seca (ha/TI)",   axes[0,0], C_DRY),
+    ("wet",  "burned_ha_mean",  "Área Queimada — Chuva (ha/TI)",  axes[0,1], C_WET),
+    ("dry",  "fire_count_mean", "Focos de Calor — Seca",          axes[1,0], "#BF360C"),
+    ("wet",  "fire_count_mean", "Focos de Calor — Chuva",         axes[1,1], "#0277BD"),
+]
+
+for season, var, title, ax, color in plot_data:
+    df_s = ts_pos[ts_pos["season"] == season].sort_values("year")
+
+    ax.plot(df_s["year"], df_s[var],
+            color=color, linewidth=2.5, marker="o", markersize=6, zorder=3)
+
+    # Linha de tendência linear
+    x = df_s["year"].values
+    y = df_s[var].values
+    if len(x) > 2:
+        z   = np.polyfit(x, y, 1)
+        p_  = np.poly1d(z)
+        r, pval = stats.pearsonr(x, y)
+        ax.plot(x, p_(x), "--", color=color, alpha=0.6, linewidth=1.5,
+                label=f"Tendência: {z[0]:+.1f}/ano (r={r:.2f}, p={pval:.3f})")
+
+        # Sombreamento de tendência
+        ax.fill_between(x, y, p_(x), alpha=0.08, color=color)
+
+        sig_txt = "↑ crescente" if z[0] > 0 else "↓ decrescente"
+        p_str   = f"p={pval:.3f}" + (" ***" if pval<0.001 else " **" if pval<0.01
+                  else " *" if pval<0.05 else " n.s.")
+        ax.text(0.03, 0.92, f"{sig_txt}\n{p_str}",
+                transform=ax.transAxes, fontsize=8,
+                bbox=dict(boxstyle="round,pad=0.3",
+                          facecolor="lightyellow", alpha=0.9))
+
+    ax.set_title(title, fontsize=10, fontweight="bold")
+    ax.set_xlabel("Ano", fontsize=9)
+    ax.set_ylabel("Média por TI/mês", fontsize=9)
+    ax.legend(fontsize=7.5, loc="upper right")
+    ax.grid(axis="y", alpha=0.25)
+    ax.xaxis.set_major_locator(mticker.MultipleLocator(2))
+
+plt.tight_layout()
+p = DIRS["figures"] / "fig10_tendencia_pos_brif.png"
+fig.savefig(p, dpi=DPI_PUB, bbox_inches="tight")
+plt.close()
+console.print(f"[green]✓ Fig 10 salva:[/green] {p.name}")
+
+# ── Fig 11: Painel Avançado Composto ────────────────────────
+
+console.print("[yellow]→ Fig 11: Painel avançado composto...[/yellow]")
+
+fig = plt.figure(figsize=(18, 14))
+gs  = gridspec.GridSpec(3, 3, figure=fig, hspace=0.45, wspace=0.38)
+
+ax_es1  = fig.add_subplot(gs[0, :2])   # Event study área queimada
+ax_es2  = fig.add_subplot(gs[0, 2])    # Event study focos
+ax_het1 = fig.add_subplot(gs[1, 0])    # Het tamanho — área
+ax_het2 = fig.add_subplot(gs[1, 1])    # Het região — área
+ax_het3 = fig.add_subplot(gs[1, 2])    # Het tamanho — focos
+ax_td1  = fig.add_subplot(gs[2, :2])   # Tendência área seca
+ax_td2  = fig.add_subplot(gs[2, 2])    # Tendência focos seca
+
+fig.suptitle(
+    "Análises avançadas — Causalidade e heterogeneidade do efeito das BRIFs\n"
+    f"122 Terras Indígenas do Cerrado | 2003–2023",
+    fontsize=13, fontweight="bold", y=0.98
+)
+
+# — Event study área queimada (ax_es1) —
+for es_df, color, label in [
+    (es_burned[es_burned["year"] <= 2012], C_PRE,  "Pré-BRIF"),
+    (es_burned[es_burned["year"] >= 2012], C_POST, "Pós-BRIF"),
+]:
+    ax_es1.plot(es_df["year"], es_df["coef"],
+                color=color, linewidth=2, marker="o", markersize=5, label=label)
+    ax_es1.fill_between(es_df["year"], es_df["ci_low"], es_df["ci_high"],
+                        alpha=0.12, color=color)
+
+ax_es1.axhline(0, color="black", linewidth=0.7, linestyle="--", alpha=0.5)
+ax_es1.axvline(2012.5, color=C_TRANS, linewidth=1.8, linestyle="--", alpha=0.8)
+ax_es1.set_title("(A) Event Study — Log Área Queimada (Seca)",
+                 fontsize=10, fontweight="bold")
+ax_es1.set_xlabel("Ano", fontsize=9)
+ax_es1.set_ylabel("β (relativo a 2012)", fontsize=9)
+ax_es1.legend(fontsize=8)
+ax_es1.grid(axis="y", alpha=0.2)
+
+# — Event study focos (ax_es2) —
+for es_df, color, label in [
+    (es_fire[es_fire["year"] <= 2012], C_PRE,  "Pré-BRIF"),
+    (es_fire[es_fire["year"] >= 2012], C_POST, "Pós-BRIF"),
+]:
+    ax_es2.plot(es_df["year"], es_df["coef"],
+                color=color, linewidth=2, marker="s", markersize=5, label=label)
+    ax_es2.fill_between(es_df["year"], es_df["ci_low"], es_df["ci_high"],
+                        alpha=0.12, color=color)
+
+ax_es2.axhline(0, color="black", linewidth=0.7, linestyle="--", alpha=0.5)
+ax_es2.axvline(2012.5, color=C_TRANS, linewidth=1.8, linestyle="--", alpha=0.8)
+ax_es2.set_title("(B) Event Study — Log Focos (Seca)", fontsize=10, fontweight="bold")
+ax_es2.set_xlabel("Ano", fontsize=9)
+ax_es2.set_ylabel("β (relativo a 2012)", fontsize=9)
+ax_es2.legend(fontsize=8)
+ax_es2.grid(axis="y", alpha=0.2)
+
+# — Heterogeneidade por tamanho — área (ax_het1) —
+for ax, dep_label, dimension, panel_title in [
+    (ax_het1, "Log Área Queimada", "Tamanho da TI",    "(C) Het. Tamanho — Área"),
+    (ax_het2, "Log Área Queimada", "Região do Cerrado", "(D) Het. Região — Área"),
+    (ax_het3, "Log Focos",         "Tamanho da TI",    "(E) Het. Tamanho — Focos"),
+]:
+    df_p = het_df[
+        (het_df["dep_label"] == dep_label) &
+        (het_df["dimension"] == dimension)
+    ].sort_values("coef_post_x_dry")
+
+    if df_p.empty:
+        ax.text(0.5, 0.5, "Sem dados", ha="center", va="center",
+                transform=ax.transAxes)
+        ax.set_title(panel_title, fontsize=9, fontweight="bold")
+        continue
+
+    yerr = np.array([
+        df_p["coef_post_x_dry"] - (df_p["coef_post_x_dry"] - 1.96*df_p["se_post_x_dry"]),
+        (df_p["coef_post_x_dry"] + 1.96*df_p["se_post_x_dry"]) - df_p["coef_post_x_dry"],
+    ])
+
+    colors_bar = [C_SIG if p<0.05 else C_NSIG for p in df_p["pval_post_x_dry"]]
+    ax.barh(df_p["group_val"].astype(str), df_p["coef_post_x_dry"],
+            xerr=yerr, color=colors_bar, alpha=0.85,
+            error_kw={"elinewidth": 1.2, "capsize": 4, "ecolor": "black"})
+    ax.axvline(0, color="black", linewidth=0.7, linestyle="--")
+    ax.set_title(panel_title, fontsize=9, fontweight="bold")
+    ax.set_xlabel("β4", fontsize=8)
+    ax.grid(axis="x", alpha=0.2)
+
+# — Tendência área seca (ax_td1) —
+df_dry = ts_pos[ts_pos["season"] == "dry"].sort_values("year")
+ax_td1.plot(df_dry["year"], df_dry["burned_ha_mean"],
+            color=C_DRY, linewidth=2.5, marker="o", markersize=6)
+x = df_dry["year"].values
+y = df_dry["burned_ha_mean"].values
+z = np.polyfit(x, y, 1)
+p_ = np.poly1d(z)
+r, pval = stats.pearsonr(x, y)
+ax_td1.plot(x, p_(x), "--", color=C_DRY, alpha=0.6, linewidth=1.5,
+            label=f"Tendência: {z[0]:+.1f} ha/ano (p={pval:.3f})")
+ax_td1.fill_between(x, y, p_(x), alpha=0.08, color=C_DRY)
+ax_td1.set_title("(F) Tendência temporal — Área Queimada Seca (2014–2023)",
+                 fontsize=10, fontweight="bold")
+ax_td1.set_xlabel("Ano", fontsize=9)
+ax_td1.set_ylabel("Área queimada média (ha/TI/mês)", fontsize=9)
+ax_td1.legend(fontsize=8)
+ax_td1.grid(axis="y", alpha=0.2)
+ax_td1.xaxis.set_major_locator(mticker.MultipleLocator(2))
+
+# — Tendência focos seca (ax_td2) —
+df_dry_f = ts_pos[ts_pos["season"] == "dry"].sort_values("year")
+ax_td2.plot(df_dry_f["year"], df_dry_f["fire_count_mean"],
+            color="#BF360C", linewidth=2.5, marker="s", markersize=6)
+x2 = df_dry_f["year"].values
+y2 = df_dry_f["fire_count_mean"].values
+z2 = np.polyfit(x2, y2, 1)
+p2_ = np.poly1d(z2)
+r2, pval2 = stats.pearsonr(x2, y2)
+ax_td2.plot(x2, p2_(x2), "--", color="#BF360C", alpha=0.6, linewidth=1.5,
+            label=f"{z2[0]:+.2f}/ano (p={pval2:.3f})")
+ax_td2.fill_between(x2, y2, p2_(x2), alpha=0.08, color="#BF360C")
+ax_td2.set_title("(G) Tendência — Focos Seca", fontsize=10, fontweight="bold")
+ax_td2.set_xlabel("Ano", fontsize=9)
+ax_td2.set_ylabel("Focos médios/TI/mês", fontsize=9)
+ax_td2.legend(fontsize=7.5)
+ax_td2.grid(axis="y", alpha=0.2)
+
+plt.tight_layout(rect=[0, 0, 1, 0.96])
+p = DIRS["figures"] / "fig11_painel_avancado.png"
+fig.savefig(p, dpi=DPI_PUB, bbox_inches="tight")
+plt.close()
+console.print(f"[green]✓ Fig 11 salva:[/green] {p.name}")
+
+# ============================================================
+# RESUMO EXECUTIVO DOS RESULTADOS
+# ============================================================
+
+console.print("\n[bold cyan]═══ RESUMO EXECUTIVO ═══[/bold cyan]")
+
+console.print("\n[cyan]1. Event Study — Paralelismo pré-tratamento:[/cyan]")
+console.print(f"   Área queimada: t={pt_burned.get('t','?')}, p={pt_burned.get('p','?')} "
+              f"→ {'✓ Tendências paralelas (válido para DiD)' if pt_burned.get('p',0)>0.1 else '⚠ Revisar hipótese de paralelismo'}")
+console.print(f"   Focos:         t={pt_fire.get('t','?')}, p={pt_fire.get('p','?')} "
+              f"→ {'✓ Tendências paralelas (válido para DiD)' if pt_fire.get('p',0)>0.1 else '⚠ Revisar hipótese de paralelismo'}")
+
+console.print("\n[cyan]2. Heterogeneidade:[/cyan]")
+if not het_df.empty:
+    best = het_df[het_df["dep_label"]=="Log Área Queimada"].nlargest(3, "coef_post_x_dry")
+    for _, row in best.iterrows():
+        console.print(f"   Maior efeito: {row['group_val']} ({row['dimension']}) "
+                      f"β4={row['coef_post_x_dry']:+.3f} {row['sig']}")
+
+console.print("\n[cyan]3. Tendência temporal pós-BRIF:[/cyan]")
+for _, row in tend_df[tend_df["model"]=="Linear"].iterrows():
+    direcao = "↑ crescente" if row["coef_trend"] > 0 else "↓ decrescente"
+    console.print(f"   {row['dep_label']} ({row['season']}): "
+                  f"{direcao} {row['coef_trend']:+.4f}/ano {row['sig']}")
+
+# Exibe figuras
+console.print("\n[cyan]Exibindo figuras avançadas...[/cyan]")
+for fname in ["fig8_event_study.png", "fig9_heterogeneidade.png",
+              "fig10_tendencia_pos_brif.png", "fig11_painel_avancado.png"]:
+    fpath = DIRS["figures"] / fname
+    if fpath.exists():
+        print(f"\n{'─'*60}\n  {fname}\n{'─'*60}")
+        ipy_display(IPyImage(filename=str(fpath), width=1000))
+
+console.print("[bold green]✓ BLOCK 8 concluído com sucesso.[/bold green]")

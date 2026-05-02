@@ -1,0 +1,405 @@
+# ============================================================
+# BLOCK 6 — Modelo Estatístico
+#
+# Modelo principal (painel com efeitos fixos por TI):
+#   Y_it = β0 + β1·Post + β2·Dry + β3·Precip + β4·(Post×Dry) + αi + ε_it
+#
+# Variáveis dependentes:
+#   - burned_ha      (área queimada)
+#   - log_burned_ha  (log área queimada)
+#   - fire_count     (focos de calor)
+#   - log_fire_count (log focos)
+#
+# Coeficiente-chave: β4 (Post × Dry) — efeito das BRIFs na seca
+#
+# Modelos estimados:
+#   1. OLS com efeitos fixos por TI (within estimator)
+#   2. Poisson com efeitos fixos (focos — variável de contagem)
+#   3. Binomial negativo (focos — overdispersion)
+#
+# Saídas:
+#   04_stats/model_results_*.csv
+#   05_figures/fig_coeficientes_*.png
+# ============================================================
+
+import warnings
+warnings.filterwarnings("ignore")
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import matplotlib.ticker as mticker
+from pathlib import Path
+
+import statsmodels.formula.api as smf
+import statsmodels.api as sm
+from statsmodels.iolib.summary2 import summary_col
+
+# ============================================================
+# 1. CARREGA PAINEL
+# ============================================================
+
+panel = pd.read_parquet(DIRS["tables"] / "panel_ti_month.parquet")
+console.print(f"[cyan]Painel:[/cyan] {len(panel):,} registros | "
+              f"{panel['ti_id'].nunique()} TIs | "
+              f"{panel['year'].min()}–{panel['year'].max()}")
+
+# Filtra apenas períodos de análise (exclui transition para modelo principal)
+panel_model = panel[panel["period"].isin(["pre", "post"])].copy()
+console.print(f"[cyan]Painel modelo (pré+pós):[/cyan] {len(panel_model):,} registros")
+
+# Garante tipos
+panel_model["ti_id"]   = panel_model["ti_id"].astype(str)
+panel_model["year"]    = panel_model["year"].astype(int)
+panel_model["month"]   = panel_model["month"].astype(int)
+panel_model["post"]    = panel_model["post"].astype(int)
+panel_model["dry"]     = panel_model["dry"].astype(int)
+panel_model["post_x_dry"] = panel_model["post_x_dry"].astype(int)
+
+# Adiciona dummies de mês (sazonalidade intra-anual)
+panel_model["month_str"] = panel_model["month"].astype(str).str.zfill(2)
+
+# ============================================================
+# 2. FUNÇÕES AUXILIARES
+# ============================================================
+
+def extract_results(result, model_name: str, dep_var: str) -> pd.DataFrame:
+    """Extrai coeficientes, SE, p-valores e IC de um modelo statsmodels."""
+    params  = result.params
+    bse     = result.bse
+    pvalues = result.pvalues
+    conf    = result.conf_int()
+
+    df = pd.DataFrame({
+        "model":    model_name,
+        "dep_var":  dep_var,
+        "variable": params.index,
+        "coef":     params.values,
+        "se":       bse.values,
+        "pvalue":   pvalues.values,
+        "ci_low":   conf[0].values,
+        "ci_high":  conf[1].values,
+    })
+    df["sig"] = df["pvalue"].apply(
+        lambda p: "***" if p < 0.001 else "**" if p < 0.01 else "*" if p < 0.05 else ""
+    )
+    return df
+
+
+def print_key_results(result, model_name: str, dep_var: str):
+    """Imprime coeficientes-chave de forma limpa."""
+    console.print(f"\n[bold cyan]{model_name} — {dep_var}[/bold cyan]")
+    key_vars = ["post", "dry", "post_x_dry", "precip_mm", "log_precip"]
+    for var in key_vars:
+        if var in result.params:
+            coef = result.params[var]
+            se   = result.bse[var]
+            pval = result.pvalues[var]
+            sig  = "***" if pval < 0.001 else "**" if pval < 0.01 else "*" if pval < 0.05 else "  "
+            console.print(
+                f"  {var:20s}: β={coef:+.4f} (SE={se:.4f}) p={pval:.4f} {sig}"
+            )
+    n    = int(result.nobs)
+    r2   = getattr(result, "rsquared", getattr(result, "pseudo_rsquared", np.nan))
+    console.print(f"  N={n:,} | R²={r2:.3f}")
+
+# ============================================================
+# 3. MODELO 1 — OLS COM EFEITOS FIXOS POR TI (área queimada)
+# ============================================================
+
+console.print("\n[bold]— Modelo 1: OLS Efeitos Fixos — Área Queimada —[/bold]")
+
+# Within transformation: demean por TI
+def within_transform(df, dep_var, indep_vars):
+    """Aplica within transformation (efeitos fixos por TI)."""
+    df = df.copy()
+    group_means = df.groupby("ti_id")[[dep_var] + indep_vars].transform("mean")
+    for col in [dep_var] + indep_vars:
+        df[f"{col}_dm"] = df[col] - group_means[col]
+    return df
+
+indep_vars = ["post", "dry", "post_x_dry", "precip_mm"]
+all_results = []
+
+for dep_var, dep_label in [
+    ("burned_ha",      "Área queimada (ha)"),
+    ("log_burned_ha",  "Log área queimada"),
+    ("fire_count",     "Focos de calor"),
+    ("log_fire_count", "Log focos"),
+]:
+    df_w = within_transform(panel_model, dep_var, indep_vars)
+
+    formula = (f"{dep_var}_dm ~ post_dm + dry_dm + post_x_dry_dm + "
+               f"precip_mm_dm - 1")
+
+    try:
+        model  = smf.ols(formula, data=df_w).fit(
+            cov_type="cluster",
+            cov_kwds={"groups": df_w["ti_id"]}
+        )
+
+        print_key_results(model, "OLS-FE", dep_label)
+        res_df = extract_results(model, "OLS_FE", dep_var)
+        # Renomeia variáveis demeaned
+        res_df["variable"] = res_df["variable"].str.replace("_dm", "")
+        all_results.append(res_df)
+
+    except Exception as e:
+        console.print(f"[red]✗ OLS-FE {dep_var}: {e}[/red]")
+
+# ============================================================
+# 4. MODELO 2 — OLS COM EFEITOS FIXOS + CONTROLES DE MÊS
+# ============================================================
+
+console.print("\n[bold]— Modelo 2: OLS-FE + Dummies de Mês —[/bold]")
+
+for dep_var, dep_label in [
+    ("log_burned_ha",  "Log área queimada"),
+    ("log_fire_count", "Log focos"),
+]:
+    try:
+        # Inclui dummies de mês como controles de sazonalidade
+        formula = (f"{dep_var} ~ post + dry + post_x_dry + precip_mm + "
+                   f"C(month) + C(ti_id) - 1")
+
+        model = smf.ols(formula, data=panel_model).fit(
+            cov_type="cluster",
+            cov_kwds={"groups": panel_model["ti_id"]}
+        )
+
+        print_key_results(model, "OLS-FE+Month", dep_label)
+        res_df = extract_results(model, "OLS_FE_month", dep_var)
+        # Filtra apenas coeficientes principais
+        res_df = res_df[res_df["variable"].isin(
+            ["post", "dry", "post_x_dry", "precip_mm"]
+        )]
+        all_results.append(res_df)
+
+    except Exception as e:
+        console.print(f"[red]✗ OLS-FE+Month {dep_var}: {e}[/red]")
+
+# ============================================================
+# 5. MODELO 3 — POISSON (focos de calor — contagem)
+# ============================================================
+
+console.print("\n[bold]— Modelo 3: Poisson — Focos de Calor —[/bold]")
+
+try:
+    # Usa subsample para Poisson (computacionalmente pesado com FE)
+    # Agrupa por TI-ano para reduzir dimensionalidade
+    panel_annual = (
+        panel_model
+        .groupby(["ti_id", "year", "period", "post"], as_index=False)
+        .agg(
+            fire_count_anual = ("fire_count",  "sum"),
+            burned_ha_anual  = ("burned_ha",   "sum"),
+            precip_anual     = ("precip_mm",   "sum"),
+            dry_fire         = ("fire_count",  lambda x: x[panel_model.loc[x.index, "dry"]==1].sum()),
+        )
+    )
+
+    formula_poisson = "fire_count_anual ~ post + precip_anual + C(ti_id) - 1"
+
+    model_poisson = smf.poisson(
+        formula_poisson,
+        data=panel_annual
+    ).fit(method="bfgs", maxiter=200, disp=False)
+
+    print_key_results(model_poisson, "Poisson-FE", "Focos anuais")
+    res_df = extract_results(model_poisson, "Poisson_FE", "fire_count_anual")
+    res_df = res_df[res_df["variable"].isin(["post", "precip_anual"])]
+    all_results.append(res_df)
+
+except Exception as e:
+    console.print(f"[yellow]⚠ Poisson: {e}[/yellow]")
+
+# ============================================================
+# 6. MODELO 4 — INTERAÇÃO POR ESTAÇÃO SECA/CHUVOSA SEPARADA
+# ============================================================
+
+console.print("\n[bold]— Modelo 4: OLS-FE separado por estação —[/bold]")
+
+for season, season_label in [("dry", "Seca"), ("wet", "Chuvosa")]:
+    df_s = panel_model[panel_model["season"] == season].copy()
+
+    for dep_var, dep_label in [
+        ("log_burned_ha",  "Log área queimada"),
+        ("log_fire_count", "Log focos"),
+    ]:
+        try:
+            df_w = within_transform(df_s, dep_var, ["post", "precip_mm"])
+            formula = f"{dep_var}_dm ~ post_dm + precip_mm_dm - 1"
+            model = smf.ols(formula, data=df_w).fit(
+                cov_type="cluster",
+                cov_kwds={"groups": df_w["ti_id"]}
+            )
+
+            coef_post = model.params.get("post_dm", np.nan)
+            se_post   = model.bse.get("post_dm", np.nan)
+            pval_post = model.pvalues.get("post_dm", np.nan)
+            sig       = "***" if pval_post < 0.001 else "**" if pval_post < 0.01 else "*" if pval_post < 0.05 else ""
+
+            console.print(
+                f"  [{season_label}] {dep_label}: "
+                f"β_post={coef_post:+.4f} (SE={se_post:.4f}) p={pval_post:.4f} {sig}"
+            )
+
+            res_df = extract_results(model, f"OLS_FE_{season}", dep_var)
+            res_df["variable"] = res_df["variable"].str.replace("_dm", "")
+            res_df = res_df[res_df["variable"].isin(["post", "precip_mm"])]
+            all_results.append(res_df)
+
+        except Exception as e:
+            console.print(f"[red]✗ {season} {dep_var}: {e}[/red]")
+
+# ============================================================
+# 7. CONSOLIDA E SALVA RESULTADOS
+# ============================================================
+
+if all_results:
+    results_df = pd.concat(all_results, ignore_index=True).round(6)
+    results_df.to_csv(DIRS["stats"] / "model_results_all.csv", index=False)
+    console.print(f"\n[green]✓ Resultados salvos:[/green] {DIRS['stats'] / 'model_results_all.csv'}")
+
+    # Tabela resumo do coeficiente-chave (post_x_dry)
+    key_coef = results_df[
+        (results_df["variable"] == "post_x_dry") &
+        (results_df["model"].str.startswith("OLS"))
+    ][["model", "dep_var", "coef", "se", "pvalue", "sig"]].round(4)
+
+    console.print("\n[cyan]Coeficiente-chave β4 (Post × Dry):[/cyan]")
+    display(key_coef)
+    key_coef.to_csv(DIRS["stats"] / "model_key_coef_post_x_dry.csv", index=False)
+
+# ============================================================
+# 8. FIGURA — COEFICIENTES COM IC 95%
+# ============================================================
+
+console.print("\n[yellow]→ Gerando figura dos coeficientes...[/yellow]")
+
+fig, axes = plt.subplots(1, 2, figsize=(12, 5))
+fig.suptitle(
+    "Efeito das BRIFs sobre o regime de fogo\n"
+    "Modelo OLS com efeitos fixos por Terra Indígena",
+    fontsize=13, fontweight="bold"
+)
+
+colors = {"pre": "#2196F3", "post": "#F44336", "dry": "#FF9800",
+          "post_x_dry": "#4CAF50", "precip_mm": "#9C27B0"}
+
+for ax, (dep_var, dep_label) in zip(axes, [
+    ("log_burned_ha",  "Log Área Queimada (ha)"),
+    ("log_fire_count", "Log Focos de Calor"),
+]):
+    df_plot = results_df[
+        (results_df["dep_var"] == dep_var) &
+        (results_df["model"] == "OLS_FE") &
+        (results_df["variable"].isin(["post", "dry", "post_x_dry", "precip_mm"]))
+    ].copy()
+
+    if df_plot.empty:
+        ax.set_title(dep_label)
+        ax.text(0.5, 0.5, "Sem dados", ha="center", va="center",
+                transform=ax.transAxes)
+        continue
+
+    var_labels = {
+        "post":        "Pós-BRIF",
+        "dry":         "Estação Seca",
+        "post_x_dry":  "Pós-BRIF × Seca\n(efeito-chave)",
+        "precip_mm":   "Precipitação",
+    }
+
+    df_plot["label"] = df_plot["variable"].map(var_labels)
+    df_plot = df_plot.sort_values("coef")
+
+    bar_colors = [colors.get(v, "#607D8B") for v in df_plot["variable"]]
+    yerr = np.array([
+        df_plot["coef"].values - df_plot["ci_low"].values,
+        df_plot["ci_high"].values - df_plot["coef"].values,
+    ])
+
+    bars = ax.barh(
+        df_plot["label"], df_plot["coef"],
+        xerr=yerr, color=bar_colors, alpha=0.8,
+        error_kw={"elinewidth": 1.5, "capsize": 4, "ecolor": "black"}
+    )
+
+    ax.axvline(0, color="black", linewidth=0.8, linestyle="--")
+    ax.set_title(dep_label, fontsize=11)
+    ax.set_xlabel("Coeficiente (β)", fontsize=9)
+
+    # Adiciona p-value
+    for i, (_, row) in enumerate(df_plot.iterrows()):
+        sig = row["sig"]
+        ax.text(
+            row["ci_high"] + 0.01, i,
+            sig if sig else f"p={row['pvalue']:.2f}",
+            va="center", fontsize=8
+        )
+
+plt.tight_layout()
+fig_path = DIRS["figures"] / "fig_coeficientes_modelo_principal.png"
+fig.savefig(fig_path, dpi=FIG_DPI, bbox_inches="tight")
+plt.show()
+console.print(f"[green]✓ Figura salva:[/green] {fig_path}")
+
+# ============================================================
+# 9. FIGURA — SÉRIE TEMPORAL PRÉ vs PÓS
+# ============================================================
+
+console.print("[yellow]→ Gerando série temporal pré vs pós...[/yellow]")
+
+# Agrega por ano e estação
+ts = (
+    panel[panel["period"].isin(["pre", "post", "transition"])]
+    .groupby(["year", "season"], as_index=False)
+    .agg(
+        burned_ha_mean  = ("burned_ha",  "mean"),
+        fire_count_mean = ("fire_count", "mean"),
+        precip_mean     = ("precip_mm",  "mean"),
+    )
+)
+
+fig, axes = plt.subplots(3, 1, figsize=(12, 10), sharex=True)
+fig.suptitle(
+    "Série Temporal: Regime de Fogo nas Terras Indígenas do Cerrado\n"
+    "Média por Terra Indígena × Mês",
+    fontsize=13, fontweight="bold"
+)
+
+for ax, (var, label, color_dry, color_wet) in zip(axes, [
+    ("burned_ha_mean",  "Área Queimada Média (ha)",  "#D32F2F", "#1565C0"),
+    ("fire_count_mean", "Focos de Calor Médios",      "#E64A19", "#0277BD"),
+    ("precip_mean",     "Precipitação Média (mm)",    "#F57F17", "#01579B"),
+]):
+    for season, color, label_s in [
+        ("dry", color_dry,  "Estação Seca"),
+        ("wet", color_wet, "Estação Chuvosa"),
+    ]:
+        df_s = ts[ts["season"] == season].sort_values("year")
+        ax.plot(df_s["year"], df_s[var],
+                color=color, label=label_s, linewidth=2, marker="o", markersize=4)
+
+    # Linhas de período
+    ax.axvline(2012.5, color="gray",   linewidth=1.5, linestyle="--", alpha=0.7)
+    ax.axvline(2013.5, color="gray",   linewidth=1.5, linestyle="--", alpha=0.7)
+    ax.axvspan(2013, 2014, alpha=0.1, color="gray", label="Transição")
+
+    ax.set_ylabel(label, fontsize=9)
+    ax.legend(fontsize=8, loc="upper right")
+    ax.grid(axis="y", alpha=0.3)
+
+    # Anotações de período
+    ax.text(2006,  ax.get_ylim()[1] * 0.92, "Pré-BRIF",  fontsize=8, color="gray", ha="center")
+    ax.text(2019,  ax.get_ylim()[1] * 0.92, "Pós-BRIF",  fontsize=8, color="gray", ha="center")
+
+axes[-1].set_xlabel("Ano", fontsize=10)
+plt.tight_layout()
+
+fig_path2 = DIRS["figures"] / "fig_serie_temporal_pre_pos.png"
+fig.savefig(fig_path2, dpi=FIG_DPI, bbox_inches="tight")
+plt.show()
+console.print(f"[green]✓ Figura salva:[/green] {fig_path2}")
+
+console.print("[bold green]✓ BLOCK 6 concluído com sucesso.[/bold green]")

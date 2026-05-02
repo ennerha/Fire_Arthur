@@ -1,0 +1,616 @@
+# ============================================================
+# BLOCK 9 — Difference-in-Differences (DiD) Verdadeiro
+#
+# Design: TIs COM BRIF (tratadas) vs TIs SEM BRIF (controle)
+#
+# Modelo:
+#   Y_it = β0 + β1·Post + β2·Treated + β3·Post×Treated
+#         + β4·Dry + β5·Post×Dry + β6·Treated×Dry
+#         + β7·Post×Treated×Dry (Triple DiD — efeito-chave)
+#         + β8·Precip + αi + γt + ε_it
+#
+# Coeficiente-chave: β7 (Post × Treated × Dry)
+#   = efeito causal das BRIFs especificamente na estação seca
+#
+# Análises:
+#   1. Identifica TIs tratadas vs controle
+#   2. DiD padrão (Post × Treated)
+#   3. Triple DiD (Post × Treated × Dry)
+#   4. Event Study com grupo controle
+#   5. Figuras comparativas
+#
+# Saídas:
+#   04_stats/did_results.csv
+#   05_figures/fig12_did_event_study.png
+#   05_figures/fig13_did_treated_control.png
+#   05_figures/fig14_did_painel_causal.png
+# ============================================================
+
+import warnings
+warnings.filterwarnings("ignore")
+
+import numpy as np
+import pandas as pd
+import geopandas as gpd
+import matplotlib.pyplot as plt
+import matplotlib.gridspec as gridspec
+import matplotlib.ticker as mticker
+import statsmodels.formula.api as smf
+from scipy import stats
+from IPython.display import display as ipy_display, Image as IPyImage
+
+plt.rcParams.update({
+    "font.family":       "DejaVu Sans",
+    "font.size":         10,
+    "axes.titlesize":    11,
+    "axes.labelsize":    10,
+    "xtick.labelsize":   9,
+    "ytick.labelsize":   9,
+    "legend.fontsize":   9,
+    "axes.spines.top":   False,
+    "axes.spines.right": False,
+    "figure.dpi":        150,
+})
+
+DPI_PUB = 500
+C_TREAT = "#C62828"   # vermelho — tratadas (com BRIF)
+C_CTRL  = "#1565C0"   # azul — controle (sem BRIF)
+C_DRY   = "#E65100"
+C_WET   = "#1565C0"
+C_TRANS = "#757575"
+C_SIG   = "#2E7D32"
+C_NSIG  = "#9E9E9E"
+
+# ============================================================
+# 1. CARREGA ASSET DAS TIs COM BRIF
+# ============================================================
+
+console.print("[bold cyan]═══ BLOCK 9: DiD Verdadeiro — BRIF vs Sem BRIF ═══[/bold cyan]")
+console.print("\n[yellow]→ Carregando asset das TIs com BRIF...[/yellow]")
+
+BRIF_ASSET = "projects/ee-enneralcantara2/assets/20260430_TIS_BRIFS"
+
+try:
+    brif_fc   = ee.FeatureCollection(BRIF_ASSET)
+    n_brif_ee = brif_fc.size().getInfo()
+    console.print(f"[green]✓ Asset carregado: {n_brif_ee} TIs com BRIF[/green]")
+
+    # Inspeciona propriedades disponíveis
+    props = brif_fc.first().propertyNames().getInfo()
+    console.print(f"  Propriedades: {props}")
+
+    # Tenta extrair identificadores
+    brif_df = geemap.ee_to_df(brif_fc)
+    console.print(f"  Colunas: {list(brif_df.columns)}")
+    console.print(f"  Primeiras linhas:")
+    display(brif_df.head())
+
+except Exception as e:
+    console.print(f"[red]✗ Erro ao carregar asset: {e}[/red]")
+    raise
+
+# ============================================================
+# 2. IDENTIFICA TRATADAS vs CONTROLE
+# ============================================================
+
+console.print("\n[yellow]→ Identificando TIs tratadas e controle...[/yellow]")
+
+# Carrega painel completo
+panel = pd.read_parquet(DIRS["tables"] / "panel_ti_month.parquet")
+tis_geo = gpd.read_file(DIRS["boundaries"] / "study_tis_cerrado.gpkg")
+
+# Detecta coluna de nome no asset BRIF
+name_cols_brif = [c for c in brif_df.columns
+                  if any(k in c.lower() for k in ["nome", "name", "terrai", "ti_"])]
+id_cols_brif   = [c for c in brif_df.columns
+                  if any(k in c.lower() for k in ["id", "cod", "codigo"])]
+
+console.print(f"  Colunas de nome candidatas: {name_cols_brif}")
+console.print(f"  Colunas de ID candidatas:   {id_cols_brif}")
+
+# Tenta match por ti_id primeiro, depois por nome
+brif_ti_ids = set()
+
+# Sempre usa terrai_nom para match (campo correto do FUNAI)
+# O campo terrai_cod do asset corresponde ao terrai_codigo do painel
+
+# Método 1: match por terrai_cod (código FUNAI)
+if "terrai_cod" in brif_df.columns and "terrai_codigo" in tis_geo.columns:
+    brif_codes = set(brif_df["terrai_cod"].dropna().astype(int).tolist())
+    ti_codes = tis_geo[["ti_id", "terrai_codigo"]].copy()
+    ti_codes["terrai_codigo"] = pd.to_numeric(ti_codes["terrai_codigo"], errors="coerce")
+    matched = ti_codes[ti_codes["terrai_codigo"].isin(brif_codes)]
+    brif_ti_ids = set(matched["ti_id"].tolist())
+    console.print(f"  Match por terrai_cod: {len(brif_ti_ids)}/{len(brif_codes)} TIs")
+
+# Método 2: match por nome (terrai_nom)
+if len(brif_ti_ids) < len(brif_df) * 0.5:
+    console.print("  [yellow]→ Complementando com match por nome (terrai_nom)...[/yellow]")
+    brif_names = set(brif_df["terrai_nom"].dropna().str.strip().str.lower().tolist())
+
+    # Tenta com ti_name do painel
+    ti_names = tis_geo[["ti_id", "ti_name"]].copy()
+    ti_names["ti_name_lower"] = ti_names["ti_name"].str.strip().str.lower()
+
+    # Match exato
+    matched_name = ti_names[ti_names["ti_name_lower"].isin(brif_names)]
+    brif_ti_ids.update(matched_name["ti_id"].tolist())
+
+    # Match parcial (substring) para nomes com acentuação diferente
+    for brif_name in brif_names:
+        for _, row in ti_names.iterrows():
+            ti_name = row["ti_name_lower"]
+            # Verifica substring em ambas as direções
+            if (brif_name[:6] in ti_name or ti_name[:6] in brif_name):
+                brif_ti_ids.add(row["ti_id"])
+
+    console.print(f"  Match por nome: {len(brif_ti_ids)} TIs identificadas")
+
+# Método 3: join espacial (fallback final)
+if len(brif_ti_ids) < 5:
+    console.print("[yellow]→ Join espacial como fallback...[/yellow]")
+    try:
+        # Usa geometrias do EE diretamente
+        brif_gdf = gpd.GeoDataFrame.from_features(
+            brif_fc.getInfo()["features"]
+        ).set_crs("EPSG:4326")
+
+        tis_geo_4326 = tis_geo.to_crs("EPSG:4326")
+        # Usa centroide para join mais robusto
+        tis_centroids = tis_geo_4326.copy()
+        tis_centroids["geometry"] = tis_geo_4326.geometry.centroid
+        joined = gpd.sjoin(tis_centroids, brif_gdf, how="inner", predicate="within")
+        brif_ti_ids.update(joined["ti_id"].unique().tolist())
+        console.print(f"  Join espacial: {len(brif_ti_ids)} TIs com BRIF")
+    except Exception as e:
+        console.print(f"[yellow]⚠ Join espacial: {e}[/yellow]")
+
+# Mostra TIs identificadas
+console.print(f"\n  [cyan]TIs com BRIF identificadas ({len(brif_ti_ids)}):[/cyan]")
+for tid in sorted(brif_ti_ids):
+    nome = tis_geo[tis_geo["ti_id"]==tid]["ti_name"].values
+    if len(nome) > 0:
+        console.print(f"    ti_id={tid}: {nome[0]}")
+
+console.print(f"\n[cyan]Resultado:[/cyan]")
+console.print(f"  TIs com BRIF (tratadas): {len(brif_ti_ids)}")
+console.print(f"  TIs sem BRIF (controle): {panel['ti_id'].nunique() - len(brif_ti_ids)}")
+console.print(f"  Total no painel:         {panel['ti_id'].nunique()}")
+
+# ============================================================
+# 3. ADICIONA VARIÁVEL DE TRATAMENTO AO PAINEL
+# ============================================================
+
+panel["treated"]      = panel["ti_id"].isin(brif_ti_ids).astype(int)
+panel["ti_id_str"]    = panel["ti_id"].astype(str)
+panel["post"]         = panel["post"].astype(int)
+panel["dry"]          = panel["dry"].astype(int)
+panel["post_x_dry"]   = panel["post_x_dry"].astype(int)
+panel["year_int"]     = panel["year"].astype(int)
+panel["month_int"]    = panel["month"].astype(int)
+
+# Interações DiD
+panel["post_x_treated"]     = panel["post"]    * panel["treated"]
+panel["dry_x_treated"]      = panel["dry"]     * panel["treated"]
+panel["post_x_dry_x_treat"] = panel["post_x_dry"] * panel["treated"]  # Triple DiD
+
+# Painel apenas pré e pós (exclui transição)
+panel_did = panel[panel["period"].isin(["pre", "post"])].copy()
+
+n_treated = panel_did[panel_did["treated"]==1]["ti_id"].nunique()
+n_control = panel_did[panel_did["treated"]==0]["ti_id"].nunique()
+console.print(f"\n[cyan]Painel DiD:[/cyan] {len(panel_did):,} obs | "
+              f"{n_treated} tratadas | {n_control} controle")
+
+# Salva identificação
+treated_tis = tis_geo[tis_geo["ti_id"].isin(brif_ti_ids)][["ti_id","ti_name","area_ha"]].copy()
+treated_tis["grupo"] = "Tratada (com BRIF)"
+control_tis = tis_geo[~tis_geo["ti_id"].isin(brif_ti_ids)][["ti_id","ti_name","area_ha"]].copy()
+control_tis["grupo"] = "Controle (sem BRIF)"
+grupos_df = pd.concat([treated_tis, control_tis], ignore_index=True)
+grupos_df.to_csv(DIRS["stats"] / "did_grupos_tratamento.csv", index=False)
+console.print(f"[green]✓ Grupos salvos: {DIRS['stats'] / 'did_grupos_tratamento.csv'}[/green]")
+
+# ============================================================
+# 4. MODELOS DiD
+# ============================================================
+
+console.print("\n[bold]— Modelos DiD —[/bold]")
+
+did_results = []
+
+def run_did_model(dep_var, dep_label, formula_extra="", model_name="DiD"):
+    formula = (f"{dep_var} ~ post + treated + post_x_treated + "
+               f"dry + post_x_dry + dry_x_treated + post_x_dry_x_treat + "
+               f"precip_mm + C(month_int) + C(ti_id_str) - 1 {formula_extra}")
+    try:
+        m = smf.ols(formula, data=panel_did).fit(
+            cov_type="cluster",
+            cov_kwds={"groups": panel_did["ti_id_str"]}
+        )
+
+        key_vars = ["post_x_treated", "post_x_dry", "post_x_dry_x_treat"]
+        console.print(f"\n  [cyan]{model_name} — {dep_label}[/cyan]")
+        for v in key_vars:
+            if v in m.params:
+                sig = ("***" if m.pvalues[v]<0.001 else "**" if m.pvalues[v]<0.01
+                       else "*" if m.pvalues[v]<0.05 else "n.s.")
+                console.print(
+                    f"    {v:30s}: β={m.params[v]:+.4f} "
+                    f"(SE={m.bse[v]:.4f}) p={m.pvalues[v]:.4f} {sig}"
+                )
+
+        for v in key_vars:
+            if v in m.params:
+                ci = m.conf_int().loc[v]
+                did_results.append({
+                    "model":    model_name,
+                    "dep_var":  dep_var,
+                    "dep_label":dep_label,
+                    "variable": v,
+                    "coef":     m.params[v],
+                    "se":       m.bse[v],
+                    "pvalue":   m.pvalues[v],
+                    "ci_low":   ci[0],
+                    "ci_high":  ci[1],
+                    "sig":      ("***" if m.pvalues[v]<0.001 else "**" if m.pvalues[v]<0.01
+                                 else "*" if m.pvalues[v]<0.05 else "n.s."),
+                    "r2":       m.rsquared,
+                    "n_obs":    int(m.nobs),
+                })
+        return m
+    except Exception as e:
+        console.print(f"  [red]✗ {model_name} {dep_label}: {e}[/red]")
+        return None
+
+m_burned = run_did_model("log_burned_ha",  "Log Área Queimada",  model_name="DiD-FE")
+m_fire   = run_did_model("log_fire_count", "Log Focos de Calor", model_name="DiD-FE")
+
+did_df = pd.DataFrame(did_results)
+did_df.to_csv(DIRS["stats"] / "did_results.csv", index=False)
+console.print(f"\n[green]✓ Resultados DiD salvos.[/green]")
+
+# Tabela resumo do Triple DiD
+triple_did = did_df[did_df["variable"] == "post_x_dry_x_treat"]
+console.print("\n[cyan]Triple DiD — Post × Treated × Dry (efeito causal na seca):[/cyan]")
+display(triple_did[["model","dep_label","coef","se","pvalue","sig","r2"]].round(4))
+
+# ============================================================
+# 5. EVENT STUDY COM GRUPO CONTROLE
+# ============================================================
+
+console.print("\n[yellow]→ Event Study com grupo controle...[/yellow]")
+
+def run_did_event_study(dep_var, label):
+    df = panel[panel["year_int"] != 2013].copy()
+    years = sorted(df["year_int"].unique())
+    years_no_base = [y for y in years if y != 2012]
+
+    for y in years_no_base:
+        df[f"d_{y}_treat"] = ((df["year_int"] == y) & (df["treated"] == 1)).astype(int)
+        df[f"d_{y}_ctrl"]  = ((df["year_int"] == y) & (df["treated"] == 0)).astype(int)
+
+    treat_terms = " + ".join([f"d_{y}_treat" for y in years_no_base])
+    ctrl_terms  = " + ".join([f"d_{y}_ctrl"  for y in years_no_base])
+    formula = f"{dep_var} ~ {treat_terms} + {ctrl_terms} + C(ti_id_str) - 1"
+
+    try:
+        m = smf.ols(formula, data=df).fit(
+            cov_type="cluster",
+            cov_kwds={"groups": df["ti_id_str"]}
+        )
+
+        rows = []
+        for y in years:
+            for grupo, suffix in [("Tratada", "treat"), ("Controle", "ctrl")]:
+                if y == 2012:
+                    rows.append({"year": y, "grupo": grupo, "coef": 0.0,
+                                 "ci_low": 0.0, "ci_high": 0.0, "pvalue": 1.0})
+                    continue
+                var = f"d_{y}_{suffix}"
+                if var in m.params:
+                    ci = m.conf_int().loc[var]
+                    rows.append({
+                        "year":    y,
+                        "grupo":   grupo,
+                        "coef":    m.params[var],
+                        "ci_low":  ci[0],
+                        "ci_high": ci[1],
+                        "pvalue":  m.pvalues[var],
+                    })
+
+        return pd.DataFrame(rows)
+    except Exception as e:
+        console.print(f"  [red]✗ Event Study DiD {label}: {e}[/red]")
+        return pd.DataFrame()
+
+es_burned_did = run_did_event_study("log_burned_ha",  "Log Área Queimada")
+es_fire_did   = run_did_event_study("log_fire_count", "Log Focos de Calor")
+
+if not es_burned_did.empty:
+    es_burned_did.to_csv(DIRS["stats"] / "did_event_study_burned.csv", index=False)
+if not es_fire_did.empty:
+    es_fire_did.to_csv(DIRS["stats"] / "did_event_study_fire.csv", index=False)
+
+console.print("[green]✓ Event Study DiD concluído.[/green]")
+
+# ============================================================
+# 6. FIGURAS
+# ============================================================
+
+# ── Fig 12: Event Study DiD ─────────────────────────────────
+
+console.print("\n[yellow]→ Fig 12: Event Study DiD...[/yellow]")
+
+fig, axes = plt.subplots(1, 2, figsize=(14, 6))
+fig.suptitle(
+    "Event Study — DiD: TIs com BRIF vs TIs sem BRIF\n"
+    "Ano base: 2012 | Efeitos relativos a TIs sem BRIF",
+    fontsize=12, fontweight="bold"
+)
+
+for ax, (es_df, title) in zip(axes, [
+    (es_burned_did, "Log Área Queimada — Estação Seca"),
+    (es_fire_did,   "Log Focos de Calor — Estação Seca"),
+]):
+    if es_df.empty:
+        ax.text(0.5, 0.5, "Sem dados", ha="center", va="center",
+                transform=ax.transAxes)
+        ax.set_title(title, fontsize=10, fontweight="bold")
+        continue
+
+    for grupo, color, ls, marker in [
+        ("Tratada",  C_TREAT, "-",  "o"),
+        ("Controle", C_CTRL,  "--", "s"),
+    ]:
+        df_g = es_df[es_df["grupo"] == grupo].sort_values("year")
+        ax.plot(df_g["year"], df_g["coef"],
+                color=color, linewidth=2, linestyle=ls,
+                marker=marker, markersize=5, label=grupo, zorder=3)
+        ax.fill_between(df_g["year"], df_g["ci_low"], df_g["ci_high"],
+                        alpha=0.12, color=color)
+
+    ax.axhline(0, color="black", linewidth=0.7, linestyle="--", alpha=0.5)
+    ax.axvline(2012.5, color=C_TRANS, linewidth=2, linestyle="--",
+               label="Implementação BRIFs", alpha=0.8)
+    ax.axvspan(2013, 2014, alpha=0.1, color=C_TRANS)
+
+    ax.set_title(title, fontsize=10, fontweight="bold")
+    ax.set_xlabel("Ano", fontsize=9)
+    ax.set_ylabel("β (relativo a 2012)", fontsize=9)
+    ax.legend(fontsize=8)
+    ax.grid(axis="y", alpha=0.25)
+    ax.xaxis.set_major_locator(mticker.MultipleLocator(2))
+
+plt.tight_layout()
+p = DIRS["figures"] / "fig12_did_event_study.png"
+fig.savefig(p, dpi=DPI_PUB, bbox_inches="tight")
+plt.close()
+console.print(f"[green]✓ Fig 12 salva.[/green]")
+
+# ── Fig 13: Trajetória Tratadas vs Controle ──────────────────
+
+console.print("[yellow]→ Fig 13: Trajetória tratadas vs controle...[/yellow]")
+
+ts_grupos = (
+    panel[panel["period"] != "outside"]
+    .groupby(["year_int", "treated", "season"], as_index=False)
+    .agg(
+        burned_ha_mean  = ("burned_ha",  "mean"),
+        fire_count_mean = ("fire_count", "mean"),
+        precip_mean     = ("precip_mm",  "mean"),
+    )
+)
+
+fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+fig.suptitle(
+    "Trajetória temporal: TIs com BRIF vs TIs sem BRIF\n"
+    "Médias mensais por Terra Indígena",
+    fontsize=12, fontweight="bold"
+)
+
+plot_cfg = [
+    ("dry",  "burned_ha_mean",  "Área Queimada — Seca (ha/TI)",   axes[0,0]),
+    ("wet",  "burned_ha_mean",  "Área Queimada — Chuva (ha/TI)",  axes[0,1]),
+    ("dry",  "fire_count_mean", "Focos de Calor — Seca",          axes[1,0]),
+    ("wet",  "fire_count_mean", "Focos de Calor — Chuva",         axes[1,1]),
+]
+
+for season, var, title, ax in plot_cfg:
+    df_s = ts_grupos[ts_grupos["season"] == season].sort_values("year_int")
+
+    for treated_val, color, label, ls in [
+        (1, C_TREAT, "Com BRIF (tratadas)", "-"),
+        (0, C_CTRL,  "Sem BRIF (controle)", "--"),
+    ]:
+        df_g = df_s[df_s["treated"] == treated_val]
+        ax.plot(df_g["year_int"], df_g[var],
+                color=color, linewidth=2.2, linestyle=ls,
+                marker="o", markersize=4, label=label, zorder=3)
+
+    ax.axvspan(2003, 2012.5, alpha=0.04, color=C_CTRL)
+    ax.axvspan(2013.5, 2023, alpha=0.04, color=C_TREAT)
+    ax.axvline(2012.5, color=C_TRANS, linewidth=1.5, linestyle="--", alpha=0.7)
+    ax.axvline(2013.5, color=C_TRANS, linewidth=1.5, linestyle="--", alpha=0.7)
+
+    ax.set_title(title, fontsize=10, fontweight="bold")
+    ax.set_xlabel("Ano", fontsize=9)
+    ax.set_ylabel("Média por TI/mês", fontsize=9)
+    ax.legend(fontsize=8)
+    ax.grid(axis="y", alpha=0.25)
+    ax.xaxis.set_major_locator(mticker.MultipleLocator(2))
+
+    ymax = ax.get_ylim()[1]
+    ax.text(2007,  ymax*0.93, "Pré-BRIF", fontsize=7.5,
+            color="gray", ha="center", style="italic")
+    ax.text(2018.5, ymax*0.93, "Pós-BRIF", fontsize=7.5,
+            color="gray", ha="center", style="italic")
+
+plt.tight_layout()
+p = DIRS["figures"] / "fig13_did_tratadas_controle.png"
+fig.savefig(p, dpi=DPI_PUB, bbox_inches="tight")
+plt.close()
+console.print(f"[green]✓ Fig 13 salva.[/green]")
+
+# ── Fig 14: Painel Causal Composto ──────────────────────────
+
+console.print("[yellow]→ Fig 14: Painel causal composto...[/yellow]")
+
+fig = plt.figure(figsize=(18, 12))
+gs  = gridspec.GridSpec(2, 3, figure=fig, hspace=0.42, wspace=0.35)
+
+ax1 = fig.add_subplot(gs[0, :2])   # trajetória seca
+ax2 = fig.add_subplot(gs[0, 2])    # coeficientes DiD
+ax3 = fig.add_subplot(gs[1, 0])    # event study burned
+ax4 = fig.add_subplot(gs[1, 1])    # event study fire
+ax5 = fig.add_subplot(gs[1, 2])    # triple DiD por variável
+
+fig.suptitle(
+    "DiD Causal — Efeito das BRIFs: TIs com BRIF vs TIs sem BRIF\n"
+    f"{n_treated} TIs tratadas | {n_control} TIs controle | Cerrado 2003–2023",
+    fontsize=13, fontweight="bold", y=0.98
+)
+
+# ax1: trajetória área queimada seca
+df_dry = ts_grupos[ts_grupos["season"] == "dry"].sort_values("year_int")
+for tv, color, label, ls in [(1, C_TREAT, "Com BRIF", "-"), (0, C_CTRL, "Sem BRIF", "--")]:
+    dg = df_dry[df_dry["treated"] == tv]
+    ax1.plot(dg["year_int"], dg["burned_ha_mean"],
+             color=color, linewidth=2.2, linestyle=ls,
+             marker="o", markersize=4, label=label)
+ax1.axvline(2012.5, color=C_TRANS, linewidth=1.5, linestyle="--", alpha=0.7)
+ax1.axvspan(2013, 2014, alpha=0.1, color=C_TRANS)
+ax1.set_title("(A) Área Queimada — Seca: Com vs Sem BRIF", fontsize=10, fontweight="bold")
+ax1.set_ylabel("Área queimada (ha/TI/mês)", fontsize=9)
+ax1.set_xlabel("Ano", fontsize=9)
+ax1.legend(fontsize=8)
+ax1.grid(axis="y", alpha=0.2)
+
+# ax2: coeficientes Triple DiD
+if not did_df.empty and "post_x_dry_x_treat" in did_df["variable"].values:
+    df_triple = did_df[did_df["variable"] == "post_x_dry_x_treat"].copy()
+    colors_did = [C_SIG if p < 0.05 else C_NSIG for p in df_triple["pvalue"]]
+    yerr = np.array([
+        df_triple["coef"] - df_triple["ci_low"],
+        df_triple["ci_high"] - df_triple["coef"],
+    ])
+    ax2.barh(df_triple["dep_label"], df_triple["coef"],
+             xerr=yerr, color=colors_did, alpha=0.85,
+             error_kw={"elinewidth": 1.5, "capsize": 5, "ecolor": "black"})
+    ax2.axvline(0, color="black", linewidth=0.8, linestyle="--")
+    for i, (_, row) in enumerate(df_triple.iterrows()):
+        ax2.text(row["ci_high"] + 0.003, i,
+                 f"{row['sig']} (p={row['pvalue']:.3f})",
+                 va="center", fontsize=8,
+                 color=C_SIG if row["sig"] != "n.s." else "gray")
+    ax2.set_title("(B) Triple DiD: β(Post×Treat×Dry)\nEfeito causal na seca",
+                  fontsize=10, fontweight="bold")
+    ax2.set_xlabel("Coeficiente β", fontsize=9)
+    ax2.grid(axis="x", alpha=0.2)
+    ax2.text(0.03, 0.05,
+             "Causal: diferença na mudança\nentre tratadas e controle na seca",
+             transform=ax2.transAxes, fontsize=7.5,
+             bbox=dict(boxstyle="round", facecolor="lightyellow", alpha=0.8))
+else:
+    ax2.text(0.5, 0.5, "Sem resultados\nTriple DiD",
+             ha="center", va="center", transform=ax2.transAxes)
+    ax2.set_title("(B) Triple DiD", fontsize=10, fontweight="bold")
+
+# ax3 e ax4: event study com controle
+for ax, es_df, title in [
+    (ax3, es_burned_did, "(C) Event Study — Área Queimada"),
+    (ax4, es_fire_did,   "(D) Event Study — Focos"),
+]:
+    if es_df.empty:
+        ax.text(0.5, 0.5, "Sem dados", ha="center", va="center",
+                transform=ax.transAxes)
+        ax.set_title(title, fontsize=9, fontweight="bold")
+        continue
+    for grupo, color, ls in [("Tratada", C_TREAT, "-"), ("Controle", C_CTRL, "--")]:
+        dg = es_df[es_df["grupo"] == grupo].sort_values("year")
+        ax.plot(dg["year"], dg["coef"],
+                color=color, linewidth=1.8, linestyle=ls,
+                marker="o", markersize=4, label=grupo)
+        ax.fill_between(dg["year"], dg["ci_low"], dg["ci_high"],
+                        alpha=0.1, color=color)
+    ax.axhline(0, color="black", linewidth=0.6, linestyle="--", alpha=0.5)
+    ax.axvline(2012.5, color=C_TRANS, linewidth=1.5, linestyle="--", alpha=0.7)
+    ax.set_title(title, fontsize=9, fontweight="bold")
+    ax.set_xlabel("Ano", fontsize=8)
+    ax.set_ylabel("β (rel. 2012)", fontsize=8)
+    ax.legend(fontsize=7)
+    ax.grid(axis="y", alpha=0.2)
+
+# ax5: comparação pré vs pós por grupo
+if not did_df.empty:
+    summary_grupos = (
+        panel_did
+        .groupby(["treated", "period", "season"], as_index=False)
+        .agg(burned_ha=("burned_ha","mean"), fire_count=("fire_count","mean"))
+    )
+    summary_grupos["grupo"] = summary_grupos["treated"].map({1:"Com BRIF", 0:"Sem BRIF"})
+    summary_grupos["estacao"] = summary_grupos["season"].map({"dry":"Seca","wet":"Chuva"})
+    summary_grupos["periodo"] = summary_grupos["period"].map({"pre":"Pré","post":"Pós"})
+
+    df_bar = summary_grupos[summary_grupos["season"]=="dry"].copy()
+    x = np.arange(len(df_bar["periodo"].unique()))
+    width = 0.35
+
+    pre_treat  = df_bar[(df_bar["grupo"]=="Com BRIF")  & (df_bar["periodo"]=="Pré")]["burned_ha"].values
+    post_treat = df_bar[(df_bar["grupo"]=="Com BRIF")  & (df_bar["periodo"]=="Pós")]["burned_ha"].values
+    pre_ctrl   = df_bar[(df_bar["grupo"]=="Sem BRIF") & (df_bar["periodo"]=="Pré")]["burned_ha"].values
+    post_ctrl  = df_bar[(df_bar["grupo"]=="Sem BRIF") & (df_bar["periodo"]=="Pós")]["burned_ha"].values
+
+    vals_treat = [pre_treat[0]  if len(pre_treat)>0  else 0,
+                  post_treat[0] if len(post_treat)>0 else 0]
+    vals_ctrl  = [pre_ctrl[0]   if len(pre_ctrl)>0   else 0,
+                  post_ctrl[0]  if len(post_ctrl)>0  else 0]
+
+    ax5.bar(x - width/2, vals_treat, width, label="Com BRIF",
+            color=C_TREAT, alpha=0.85)
+    ax5.bar(x + width/2, vals_ctrl,  width, label="Sem BRIF",
+            color=C_CTRL,  alpha=0.85)
+
+    ax5.set_xticks(x)
+    ax5.set_xticklabels(["Pré-BRIF", "Pós-BRIF"])
+    ax5.set_title("(E) Área Queimada (Seca)\nPré vs Pós por Grupo",
+                  fontsize=9, fontweight="bold")
+    ax5.set_ylabel("Média (ha/TI/mês)", fontsize=8)
+    ax5.legend(fontsize=8)
+    ax5.grid(axis="y", alpha=0.2)
+
+plt.tight_layout(rect=[0, 0, 1, 0.96])
+p = DIRS["figures"] / "fig14_did_painel_causal.png"
+fig.savefig(p, dpi=DPI_PUB, bbox_inches="tight")
+plt.close()
+console.print(f"[green]✓ Fig 14 salva.[/green]")
+
+# ============================================================
+# 7. RESUMO EXECUTIVO
+# ============================================================
+
+console.print("\n[bold cyan]═══ RESUMO EXECUTIVO — DiD Causal ═══[/bold cyan]")
+console.print(f"\n  TIs com BRIF (tratadas): {n_treated}")
+console.print(f"  TIs sem BRIF (controle): {n_control}")
+
+if not did_df.empty:
+    triple = did_df[did_df["variable"] == "post_x_dry_x_treat"]
+    for _, row in triple.iterrows():
+        efeito = (np.exp(row["coef"]) - 1) * 100
+        console.print(
+            f"\n  Triple DiD — {row['dep_label']}:"
+            f"\n    β = {row['coef']:+.4f} (SE={row['se']:.4f}, p={row['pvalue']:.4f}) {row['sig']}"
+            f"\n    Efeito estimado: {efeito:+.1f}% na estação seca pós-BRIF"
+            f"\n    (diferença na mudança entre TIs com e sem BRIF)"
+        )
+
+# Exibe figuras
+console.print("\n[cyan]Exibindo figuras...[/cyan]")
+for fname in ["fig12_did_event_study.png", "fig13_did_tratadas_controle.png",
+              "fig14_did_painel_causal.png"]:
+    fpath = DIRS["figures"] / fname
+    if fpath.exists():
+        print(f"\n{'─'*60}\n  {fname}\n{'─'*60}")
+        ipy_display(IPyImage(filename=str(fpath), width=1000))
+
+console.print("[bold green]✓ BLOCK 9 concluído com sucesso.[/bold green]")

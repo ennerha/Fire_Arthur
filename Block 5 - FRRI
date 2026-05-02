@@ -1,0 +1,339 @@
+# ============================================================
+# BLOCK 5 — Métricas avançadas + FRRI completo
+#
+# Métricas tradicionais:
+#   - Focos de calor totais
+#   - Área queimada total
+#
+# Métricas avançadas (novidade do estudo):
+#   - Área queimada na estação seca (fogo crítico)
+#   - Proporção seca/chuvosa (redistribuição sazonal)
+#   - Frequência de recorrência (reburning)
+#   - Fragmentação: tamanho médio dos eventos mensais de queima
+#
+# FRRI = C1 (redução fogo crítico)
+#       + C2 (redistribuição sazonal)
+#       + C3 (redução área total)
+#       + C4 (recorrência/fragmentação)
+#       + C5 (independência climática)
+#
+# Saídas:
+#   03_tables/metrics_ti_year.parquet
+#   03_tables/frri_ti.parquet
+#   04_stats/summary_frri_*.csv
+# ============================================================
+
+import scipy.stats as stats
+from statsmodels.formula.api import ols
+
+# ============================================================
+# 1. CARREGA PAINEL
+# ============================================================
+
+panel = pd.read_parquet(DIRS["tables"] / "panel_ti_month.parquet")
+console.print(f"[cyan]Painel carregado:[/cyan] {len(panel):,} registros | "
+              f"{panel['ti_id'].nunique()} TIs | "
+              f"{panel['year'].min()}–{panel['year'].max()}")
+
+# ============================================================
+# 2. MÉTRICAS ANUAIS POR TI
+# ============================================================
+
+def compute_annual_metrics(panel: pd.DataFrame) -> pd.DataFrame:
+    rows = []
+
+    for (ti_id, year), grp in panel.groupby(["ti_id", "year"]):
+        dry = grp[grp["dry"] == 1]
+        wet = grp[grp["dry"] == 0]
+
+        area_ha = grp["area_ha"].iloc[0]
+
+        # ── Área queimada ──────────────────────────────────────
+        burned_total = grp["burned_ha"].sum()
+        burned_dry   = dry["burned_ha"].sum()
+        burned_wet   = wet["burned_ha"].sum()
+
+        # ── Focos ──────────────────────────────────────────────
+        fire_total = grp["fire_count"].sum()
+        fire_dry   = dry["fire_count"].sum()
+        fire_wet   = wet["fire_count"].sum()
+
+        # ── Precipitação ───────────────────────────────────────
+        precip_total = grp["precip_mm"].sum()
+        precip_dry   = dry["precip_mm"].sum()
+        precip_wet   = wet["precip_mm"].sum()
+
+        # ── Redistribuição sazonal ─────────────────────────────
+        burned_dry_frac = burned_dry / burned_total if burned_total > 0 else np.nan
+        fire_dry_frac   = fire_dry   / fire_total   if fire_total   > 0 else np.nan
+
+        # ── Recorrência (reburning) ────────────────────────────
+        # Número de meses com fogo no ano (proxy de recorrência intra-anual)
+        months_with_fire   = (grp["burned_ha"] > 0).sum()
+        months_with_fire_dry = (dry["burned_ha"] > 0).sum()
+
+        # ── Fragmentação ───────────────────────────────────────
+        # Proxy: variância mensal da área queimada na seca
+        # Alta variância → fogo concentrado em poucos meses (menos fragmentado)
+        # Baixa variância → fogo distribuído (mais fragmentado/manejado)
+        dry_burned_vals = dry["burned_ha"].values
+        fragmentation_cv = (np.std(dry_burned_vals) / np.mean(dry_burned_vals)
+                            if np.mean(dry_burned_vals) > 0 else np.nan)
+
+        rows.append({
+            "ti_id":   ti_id,
+            "ti_name": grp["ti_name"].iloc[0],
+            "year":    year,
+            "period":  grp["period"].iloc[0],
+            "area_ha": area_ha,
+
+            # Área queimada
+            "burned_ha_total":    burned_total,
+            "burned_ha_dry":      burned_dry,
+            "burned_ha_wet":      burned_wet,
+            "burned_pct_total":   (burned_total / area_ha * 100) if area_ha > 0 else np.nan,
+            "burned_dry_frac":    burned_dry_frac,
+
+            # Focos
+            "fire_total":         fire_total,
+            "fire_dry":           fire_dry,
+            "fire_wet":           fire_wet,
+            "fire_dry_frac":      fire_dry_frac,
+            "fire_density_mean":  grp["fire_density"].mean(),
+
+            # Sazonalidade
+            "months_with_fire":      months_with_fire,
+            "months_with_fire_dry":  months_with_fire_dry,
+            "fragmentation_cv":      fragmentation_cv,   # coef variação mensal
+
+            # Precipitação
+            "precip_total_mm":    precip_total,
+            "precip_dry_mm":      precip_dry,
+            "precip_wet_mm":      precip_wet,
+            "precip_anomaly_mean":grp["precip_anomaly"].mean(),
+        })
+
+    df = pd.DataFrame(rows)
+    df["year"] = df["year"].astype("Int64")
+    return df.sort_values(["ti_id", "year"]).reset_index(drop=True)
+
+
+console.print("[yellow]→ Calculando métricas anuais por TI...[/yellow]")
+metrics = compute_annual_metrics(panel)
+console.print(f"[green]✓ {len(metrics):,} registros (TI × ano)[/green]")
+
+# ============================================================
+# 3. RECORRÊNCIA INTERANUAL (reburning)
+# ============================================================
+
+def compute_reburning(metrics: pd.DataFrame) -> pd.DataFrame:
+    """
+    Para cada TI, calcula a frequência com que um mesmo ano
+    teve fogo depois de ter tido fogo no ano anterior.
+    Retorna coluna reburning_rate por TI × período.
+    """
+    rows = []
+    for ti_id, grp in metrics.groupby("ti_id"):
+        grp = grp.sort_values("year")
+        had_fire      = (grp["burned_ha_total"] > 0).astype(int).values
+        # reburning: ano com fogo após ano com fogo
+        reburning     = np.sum((had_fire[1:] == 1) & (had_fire[:-1] == 1))
+        possible      = np.sum(had_fire[:-1] == 1)
+        reburning_rate = reburning / possible if possible > 0 else np.nan
+        rows.append({"ti_id": ti_id, "reburning_rate": reburning_rate})
+    return pd.DataFrame(rows)
+
+
+reburning_df = compute_reburning(metrics)
+metrics = metrics.merge(reburning_df, on="ti_id", how="left")
+
+# ============================================================
+# 4. FIRE REGIME REORGANIZATION INDEX (FRRI)
+# ============================================================
+
+def compute_frri(metrics: pd.DataFrame,
+                 pre_period: tuple,
+                 post_period: tuple) -> pd.DataFrame:
+    """
+    FRRI com 5 componentes conforme fluxograma:
+
+    C1 — Redução do fogo crítico (área queimada na seca)
+    C2 — Redistribuição sazonal (queda na fração seca/total)
+    C3 — Redução da área queimada total
+    C4 — Fragmentação/recorrência (redução do CV mensal e reburning)
+    C5 — Independência climática (C1 ajustado pela precipitação)
+
+    Escala: valores positivos = reorganização favorável
+    FRRI ∈ [-1, 1] aproximadamente
+    """
+    pre  = metrics[metrics["year"].between(*pre_period)]
+    post = metrics[metrics["year"].between(*post_period)]
+
+    rows = []
+
+    for ti_id in metrics["ti_id"].unique():
+        pre_ti  = pre[pre["ti_id"]  == ti_id]
+        post_ti = post[post["ti_id"] == ti_id]
+
+        if pre_ti.empty or post_ti.empty:
+            continue
+
+        ti_name  = metrics[metrics["ti_id"] == ti_id]["ti_name"].iloc[0]
+        area_ha  = metrics[metrics["ti_id"] == ti_id]["area_ha"].iloc[0]
+        reb_rate = metrics[metrics["ti_id"] == ti_id]["reburning_rate"].iloc[0]
+
+        # Médias por período
+        p = {
+            "pre_burned_dry":    pre_ti["burned_ha_dry"].mean(),
+            "post_burned_dry":   post_ti["burned_ha_dry"].mean(),
+            "pre_burned_total":  pre_ti["burned_ha_total"].mean(),
+            "post_burned_total": post_ti["burned_ha_total"].mean(),
+            "pre_dry_frac":      pre_ti["burned_dry_frac"].mean(),
+            "post_dry_frac":     post_ti["burned_dry_frac"].mean(),
+            "pre_precip_dry":    pre_ti["precip_dry_mm"].mean(),
+            "post_precip_dry":   post_ti["precip_dry_mm"].mean(),
+            "pre_frag_cv":       pre_ti["fragmentation_cv"].mean(),
+            "post_frag_cv":      post_ti["fragmentation_cv"].mean(),
+            "pre_months_fire":   pre_ti["months_with_fire_dry"].mean(),
+            "post_months_fire":  post_ti["months_with_fire_dry"].mean(),
+        }
+
+        def rel_change(pre_val, post_val):
+            """Mudança relativa: positivo = redução (reorganização)."""
+            if pre_val > 0 and not np.isnan(pre_val):
+                return (pre_val - post_val) / pre_val
+            return np.nan
+
+        # C1: redução do fogo crítico (seco)
+        c1 = rel_change(p["pre_burned_dry"], p["post_burned_dry"])
+
+        # C2: redistribuição sazonal (queda na fração seca)
+        c2 = rel_change(p["pre_dry_frac"], p["post_dry_frac"])
+
+        # C3: redução da área total queimada
+        c3 = rel_change(p["pre_burned_total"], p["post_burned_total"])
+
+        # C4: fragmentação + recorrência
+        # Queda no CV mensal (fogo mais distribuído = mais fragmentado = mais manejado)
+        # + reburning rate (quanto menor, melhor)
+        c4_frag = rel_change(p["pre_frag_cv"], p["post_frag_cv"]) * -1  # menor CV = mais fragmentado
+        c4_reb  = (1 - reb_rate) if not np.isnan(reb_rate) else np.nan   # menos reburning = melhor
+        c4_vals = [v for v in [c4_frag, c4_reb] if not np.isnan(v)]
+        c4 = np.mean(c4_vals) if c4_vals else np.nan
+
+        # C5: independência climática
+        # C1 ajustado: se precipitação caiu mas fogo também caiu → efeito real
+        precip_ratio = (p["post_precip_dry"] / p["pre_precip_dry"]
+                        if p["pre_precip_dry"] > 0 else 1.0)
+        c5 = c1 / precip_ratio if (not np.isnan(c1) and precip_ratio > 0) else np.nan
+
+        # Clipa componentes
+        def clip(v, lo=-1, hi=1):
+            return float(np.clip(v, lo, hi)) if not np.isnan(v) else np.nan
+
+        comps = {
+            "c1_fogo_critico":    clip(c1),
+            "c2_redistribuicao":  clip(c2),
+            "c3_area_total":      clip(c3),
+            "c4_fragmentacao":    clip(c4),
+            "c5_clima_adj":       clip(c5, -2, 2),
+        }
+
+        # Pesos: C1 e C2 têm maior peso (hipóteses centrais H2 e H3)
+        weights = {"c1_fogo_critico": 0.30, "c2_redistribuicao": 0.25,
+                   "c3_area_total":   0.20, "c4_fragmentacao":   0.15,
+                   "c5_clima_adj":    0.10}
+
+        frri_num = frri_den = 0
+        for k, w in weights.items():
+            v = comps[k]
+            if not np.isnan(v):
+                frri_num += v * w
+                frri_den += w
+
+        frri = round(frri_num / frri_den, 4) if frri_den > 0 else np.nan
+
+        rows.append({
+            "ti_id":   ti_id,
+            "ti_name": ti_name,
+            "area_ha": area_ha,
+            **comps,
+            "frri":                    frri,
+            "reburning_rate":          round(reb_rate, 4) if not np.isnan(reb_rate) else np.nan,
+            "pre_burned_ha_dry":       round(p["pre_burned_dry"],    2),
+            "post_burned_ha_dry":      round(p["post_burned_dry"],   2),
+            "pre_burned_ha_total":     round(p["pre_burned_total"],  2),
+            "post_burned_ha_total":    round(p["post_burned_total"], 2),
+            "pre_burned_dry_frac":     round(p["pre_dry_frac"],  4) if not np.isnan(p["pre_dry_frac"])  else np.nan,
+            "post_burned_dry_frac":    round(p["post_dry_frac"], 4) if not np.isnan(p["post_dry_frac"]) else np.nan,
+            "pre_precip_dry_mm":       round(p["pre_precip_dry"],  2),
+            "post_precip_dry_mm":      round(p["post_precip_dry"], 2),
+        })
+
+    df = pd.DataFrame(rows).sort_values("frri", ascending=False).reset_index(drop=True)
+    return df
+
+
+console.print("[yellow]→ Calculando FRRI (5 componentes)...[/yellow]")
+frri = compute_frri(metrics, PRE_PERIOD, POST_PERIOD)
+console.print(f"[green]✓ FRRI calculado para {len(frri)} TIs[/green]")
+
+# ============================================================
+# 5. SALVA
+# ============================================================
+
+metrics.to_parquet(DIRS["tables"] / "metrics_ti_year.parquet", index=False)
+metrics.to_csv(    DIRS["tables"] / "metrics_ti_year.csv",     index=False)
+
+frri.to_parquet(DIRS["tables"] / "frri_ti.parquet", index=False)
+frri.to_csv(    DIRS["tables"] / "frri_ti.csv",     index=False)
+
+console.print(f"[green]✓ Métricas anuais:[/green] {DIRS['tables'] / 'metrics_ti_year.csv'}")
+console.print(f"[green]✓ FRRI:[/green]            {DIRS['tables'] / 'frri_ti.csv'}")
+
+# ============================================================
+# 6. DIAGNÓSTICO DO FRRI
+# ============================================================
+
+frri_valid = frri.dropna(subset=["frri"])
+
+console.print(f"\n[cyan]FRRI — Distribuição:[/cyan]")
+console.print(f"  TIs com FRRI válido:           {len(frri_valid)}/{len(frri)}")
+console.print(f"  Média:                         {frri_valid['frri'].mean():.3f}")
+console.print(f"  Mediana:                       {frri_valid['frri'].median():.3f}")
+console.print(f"  % TIs com FRRI > 0:            {(frri_valid['frri'] > 0).mean()*100:.1f}%")
+console.print(f"  % TIs com reorganização forte (FRRI > 0.2): "
+              f"{(frri_valid['frri'] > 0.2).mean()*100:.1f}%")
+
+# Contribuição média de cada componente
+for c, label in [("c1_fogo_critico",   "C1 Fogo crítico"),
+                 ("c2_redistribuicao", "C2 Redistribuição"),
+                 ("c3_area_total",     "C3 Área total"),
+                 ("c4_fragmentacao",   "C4 Fragmentação"),
+                 ("c5_clima_adj",      "C5 Clima adj.")]:
+    val = frri_valid[c].mean()
+    console.print(f"  {label}: {val:+.3f}")
+
+# Top 15 TIs
+console.print("\n[cyan]Top 15 TIs — maior reorganização:[/cyan]")
+display(frri_valid.head(15)[["ti_name", "area_ha", "frri",
+                              "c1_fogo_critico", "c2_redistribuicao",
+                              "c3_area_total",   "c4_fragmentacao"]])
+
+# Sumário por quartil
+frri_valid = frri_valid.copy()
+frri_valid["frri_quartil"] = pd.qcut(frri_valid["frri"], q=4,
+                                      labels=["Q1 (baixo)", "Q2", "Q3", "Q4 (alto)"])
+summary_quartil = (
+    frri_valid.groupby("frri_quartil", observed=True)
+    .agg(n=("ti_id","count"), frri=("frri","mean"),
+         c1=("c1_fogo_critico","mean"), c2=("c2_redistribuicao","mean"),
+         c3=("c3_area_total","mean"),   c4=("c4_fragmentacao","mean"))
+    .round(3)
+)
+
+summary_quartil.to_csv(DIRS["stats"] / "summary_frri_quartis.csv")
+frri_valid.to_csv(     DIRS["stats"] / "frri_full.csv", index=False)
+
+display(summary_quartil)
+console.print("[bold green]✓ BLOCK 5 concluído com sucesso.[/bold green]")

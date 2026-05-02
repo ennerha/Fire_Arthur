@@ -1,0 +1,561 @@
+# ============================================================
+# PROJECT: Indigenous Fire Brigades and Fire Regime Reorganization
+# BLOCK 0 — Setup completo com download automático das Terras Indígenas
+# Google Colab + Google Drive + Google Earth Engine
+# ============================================================
+
+!pip -q install geemap geopandas pyogrio rasterio rioxarray shapely tqdm rich \
+                 pyarrow openpyxl statsmodels scipy scikit-learn mapclassify \
+                 matplotlib contextily
+
+import os
+import json
+import time
+import warnings
+import urllib.request
+from pathlib import Path
+from datetime import datetime
+
+import ee
+import geemap
+import numpy as np
+import pandas as pd
+import geopandas as gpd
+import matplotlib.pyplot as plt
+
+from shapely.geometry import box
+from tqdm.auto import tqdm
+from rich.console import Console
+from rich.table import Table
+from google.colab import drive
+
+warnings.filterwarnings("ignore")
+console = Console()
+
+# ============================================================
+# 1. USER CONFIGURATION
+# ============================================================
+
+PROJECT_NAME = "indigenous_fire_brigades_cerrado"
+PROJECT_ROOT = Path(f"/content/drive/MyDrive/{PROJECT_NAME}")
+
+FORCE_REPROCESS = False
+
+START_YEAR = 2001
+TRANSITION_YEAR = 2013
+END_YEAR = 2024
+
+PRE_PERIOD  = (2003, 2012)   # conforme fluxograma
+POST_PERIOD = (2014, 2023)   # conforme fluxograma (MapBiomas vai até 2023)
+
+DRY_MONTHS  = [5, 6, 7, 8, 9, 10]
+WET_MONTHS  = [11, 12, 1, 2, 3, 4]
+
+EE_PROJECT = "ee-enneralcantara2"
+
+CHIRPS_SCALE     = 5566
+MAPBIOMAS_SCALE  = 30
+AREA_CRS         = "EPSG:5880"
+
+FIG_DPI     = 500
+FONT_FAMILY = "DejaVu Sans"
+
+# Defina manualmente se já tiver o arquivo; caso contrário, deixe None
+# Exemplo: TI_VECTOR_PATH = "/content/drive/MyDrive/minha_pasta/tis.gpkg"
+TI_VECTOR_PATH = None
+
+# Bbox aproximado do Cerrado (lon_min, lat_min, lon_max, lat_max)
+CERRADO_BBOX = (-60.0, -24.0, -41.0, -2.0)
+
+# URLs para download (em ordem de prioridade)
+TI_DOWNLOAD_URLS = [
+    # TerraBrasilis — INPE/FUNAI (WFS GeoJSON)
+    (
+        "https://terrabrasilis.dpi.inpe.br/geoserver/funai/ows"
+        "?service=WFS&version=1.0.0&request=GetFeature"
+        "&typeName=funai:ti_sirgas&outputFormat=application%2Fjson"
+    ),
+    # FUNAI geoserver direto
+    (
+        "https://geoserver.funai.gov.br/geoserver/Funai/ows"
+        "?service=WFS&version=1.0.0&request=GetFeature"
+        "&typeName=Funai:tis_poligonais_portarias"
+        "&outputFormat=application%2Fjson"
+    ),
+]
+
+POSSIBLE_NAME_FIELDS = [
+    "terrai_nome",                            # FUNAI geoserver (campo correto)
+    "nome", "Nome", "NOME",
+    "terrai_nom", "terrai_no", "terrai",
+    "name", "Name", "NAME",
+    "TI", "ti", "terra_indigena",
+    "nom_ti", "NOM_TI", "nome_ti", "NOME_TI",
+]
+
+plt.rcParams.update({
+    "font.family": FONT_FAMILY,
+    "font.size": 10,
+    "axes.titlesize": 12,
+    "axes.labelsize": 10,
+    "xtick.labelsize": 9,
+    "ytick.labelsize": 9,
+    "legend.fontsize": 9,
+    "figure.dpi": 150,
+})
+
+# ============================================================
+# 2. SAFE GOOGLE DRIVE MOUNT
+# ============================================================
+
+if Path("/content/drive/MyDrive").exists():
+    console.print("[green]✓ Google Drive já montado.[/green]")
+else:
+    try:
+        drive.mount("/content/drive")
+        console.print("[green]✓ Google Drive montado.[/green]")
+    except ValueError as e:
+        console.print(f"[yellow]Aviso no mount:[/yellow] {e}")
+        if Path("/content/drive/MyDrive").exists():
+            console.print("[green]✓ Google Drive disponível apesar do aviso.[/green]")
+        else:
+            raise e
+
+# ============================================================
+# 3. FOLDER STRUCTURE
+# ============================================================
+
+DIRS = {
+    "raw":       PROJECT_ROOT / "00_raw",
+    "boundaries": PROJECT_ROOT / "01_boundaries",
+    "cache":     PROJECT_ROOT / "02_cache",
+    "tables":    PROJECT_ROOT / "03_tables",
+    "stats":     PROJECT_ROOT / "04_stats",
+    "figures":   PROJECT_ROOT / "05_figures",
+    "logs":      PROJECT_ROOT / "06_logs",
+    "exports":   PROJECT_ROOT / "07_exports",
+}
+
+for d in DIRS.values():
+    d.mkdir(parents=True, exist_ok=True)
+
+console.print(f"[green]✓ Pastas do projeto prontas:[/green] {PROJECT_ROOT}")
+
+# ============================================================
+# 4. EARTH ENGINE INITIALIZATION
+# ============================================================
+
+try:
+    ee.Initialize(project=EE_PROJECT)
+    console.print(f"[green]✓ Earth Engine inicializado: {EE_PROJECT}[/green]")
+except Exception:
+    ee.Authenticate()
+    ee.Initialize(project=EE_PROJECT)
+    console.print(f"[green]✓ Earth Engine autenticado e inicializado: {EE_PROJECT}[/green]")
+
+# ============================================================
+# 5. CACHE / CHECKPOINT UTILITIES
+# ============================================================
+
+def cache_path(name, ext="parquet"):
+    return DIRS["cache"] / f"{name}.{ext}"
+
+def table_path(name, ext="csv"):
+    return DIRS["tables"] / f"{name}.{ext}"
+
+def stats_path(name, ext="csv"):
+    return DIRS["stats"] / f"{name}.{ext}"
+
+def fig_path(name, ext="png"):
+    return DIRS["figures"] / f"{name}.{ext}"
+
+def save_json(obj, path):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(obj, f, indent=2, ensure_ascii=False)
+
+def read_table(path):
+    path = Path(path)
+    if path.suffix == ".parquet":
+        return pd.read_parquet(path)
+    if path.suffix == ".csv":
+        return pd.read_csv(path)
+    raise ValueError(f"Formato não suportado: {path}")
+
+def write_table(df, path):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if path.suffix == ".parquet":
+        df.to_parquet(path, index=False)
+    elif path.suffix == ".csv":
+        df.to_csv(path, index=False)
+    else:
+        raise ValueError(f"Formato não suportado: {path}")
+
+def checkpoint_load_or_run(name, func, ext="parquet", force=FORCE_REPROCESS):
+    path = cache_path(name, ext)
+    if path.exists() and not force:
+        console.print(f"[cyan]✓ Carregando checkpoint:[/cyan] {path.name}")
+        return read_table(path)
+    console.print(f"[yellow]→ Processando:[/yellow] {name}")
+    df = func()
+    write_table(df, path)
+    console.print(f"[green]✓ Checkpoint salvo:[/green] {path}")
+    return df
+
+# ============================================================
+# 6. TIME UTILITIES
+# ============================================================
+
+def period_label(year):
+    year = int(year)
+    if PRE_PERIOD[0] <= year <= PRE_PERIOD[1]:
+        return "pre"
+    if year == TRANSITION_YEAR:
+        return "transition"
+    if POST_PERIOD[0] <= year <= POST_PERIOD[1]:
+        return "post"
+    return "outside"
+
+def season_label(month):
+    return "dry" if int(month) in DRY_MONTHS else "wet"
+
+def add_time_fields(df):
+    df = df.copy()
+    df["year"]  = df["year"].astype(int)
+    df["month"] = df["month"].astype(int)
+    df["date"]  = pd.to_datetime(dict(year=df["year"], month=df["month"], day=1))
+    df["period"]    = df["year"].apply(period_label)
+    df["season"]    = df["month"].apply(season_label)
+    df["post"]      = (df["period"] == "post").astype(int)
+    df["dry"]       = (df["season"] == "dry").astype(int)
+    df["post_x_dry"] = df["post"] * df["dry"]
+    return df
+
+def month_panel():
+    rows = [{"year": y, "month": m}
+            for y in range(START_YEAR, END_YEAR + 1)
+            for m in range(1, 13)]
+    return pd.DataFrame(rows)
+
+# ============================================================
+# 7. DOWNLOAD AUTOMÁTICO DAS TERRAS INDÍGENAS
+# ============================================================
+
+def download_terras_indigenas(filter_cerrado: bool = True) -> Path:
+    """
+    Baixa as Terras Indígenas do TerraBrasilis (INPE/FUNAI) via WFS.
+    Tenta as URLs em TI_DOWNLOAD_URLS em ordem.
+    Se filter_cerrado=True, mantém apenas as TIs que intersectam o bbox do Cerrado.
+    Retorna o Path do arquivo .gpkg salvo em 00_raw/.
+    """
+    gpkg_out = DIRS["raw"] / "terras_indigenas_funai.gpkg"
+
+    if gpkg_out.exists() and not FORCE_REPROCESS:
+        console.print(f"[cyan]✓ Arquivo já existe, pulando download:[/cyan] {gpkg_out.name}")
+        return gpkg_out
+
+    geojson_out = DIRS["raw"] / "terras_indigenas_funai_raw.geojson"
+    gdf = None
+    last_error = None
+
+    for i, url in enumerate(TI_DOWNLOAD_URLS, 1):
+        console.print(f"[yellow]→ Tentativa {i}/{len(TI_DOWNLOAD_URLS)}: baixando TIs...[/yellow]")
+        console.print(f"   URL: {url[:80]}...")
+        try:
+            urllib.request.urlretrieve(url, geojson_out)
+            gdf = gpd.read_file(geojson_out)
+            console.print(f"[green]✓ Download OK — {len(gdf)} feições carregadas.[/green]")
+            break
+        except Exception as e:
+            last_error = e
+            console.print(f"[red]✗ Falhou: {e}[/red]")
+
+    if gdf is None:
+        raise RuntimeError(
+            f"Todas as tentativas de download falharam.\n"
+            f"Último erro: {last_error}\n"
+            f"Faça o upload manual de um .gpkg/.shp/.geojson para:\n"
+            f"  {DIRS['raw']}\n"
+            f"e defina TI_VECTOR_PATH no início do script."
+        )
+
+    console.print(f"[cyan]Colunas disponíveis:[/cyan] {list(gdf.columns)}")
+
+    # Garante CRS geográfico
+    if gdf.crs is None:
+        gdf = gdf.set_crs("EPSG:4326")
+    else:
+        gdf = gdf.to_crs("EPSG:4326")
+
+    # Filtra pelo Cerrado (bounding box aproximado)
+    if filter_cerrado:
+        cerrado_geom = box(*CERRADO_BBOX)
+        mask = gdf.geometry.intersects(cerrado_geom)
+        n_before = len(gdf)
+        gdf = gdf[mask].copy()
+        console.print(
+            f"[cyan]Filtro Cerrado:[/cyan] {n_before} → {len(gdf)} TIs "
+            f"(bbox {CERRADO_BBOX})"
+        )
+
+    if gdf.empty:
+        raise ValueError(
+            "Nenhuma TI encontrada após o filtro do Cerrado. "
+            "Verifique CERRADO_BBOX ou defina filter_cerrado=False."
+        )
+
+    gdf.to_file(gpkg_out, driver="GPKG")
+    console.print(f"[green]✓ Salvo em GPKG:[/green] {gpkg_out}")
+
+    # Remove GeoJSON intermediário para economizar espaço
+    if geojson_out.exists():
+        geojson_out.unlink()
+
+    return gpkg_out
+
+# ============================================================
+# 8. AUTO-DETECT E PREPARAÇÃO DA ÁREA DE ESTUDO
+# ============================================================
+
+def find_boundary_file() -> Path:
+    search_roots = [PROJECT_ROOT, Path("/content/drive/MyDrive")]
+    candidates = []
+
+    for root in search_roots:
+        if root.exists():
+            for ext in ["*.shp", "*.gpkg", "*.geojson", "*.json"]:
+                candidates.extend(list(root.rglob(ext)))
+
+    candidates = list(dict.fromkeys(candidates))
+
+    if not candidates:
+        raise FileNotFoundError(
+            "Nenhum arquivo de limites encontrado no Google Drive.\n"
+            "Faça upload de um .shp/.gpkg/.geojson com as Terras Indígenas."
+        )
+
+    keywords = ["terra", "indig", "indigena", "indígena", "ti", "cerrado", "funai", "study"]
+    scored = []
+    for f in candidates:
+        name = str(f).lower()
+        score = sum(k in name for k in keywords)
+        if "study_area_dissolved" in name:
+            score -= 2
+        if "study_tis" in name:
+            score += 2
+        scored.append((score, f))
+
+    scored.sort(key=lambda x: x[0], reverse=True)
+
+    console.print("[cyan]Candidatos encontrados:[/cyan]")
+    for score, f in scored[:15]:
+        console.print(f"  score={score} | {f}")
+
+    return scored[0][1]
+
+def detect_name_field(gdf) -> str:
+    for col in POSSIBLE_NAME_FIELDS:
+        if col in gdf.columns:
+            return col
+    text_cols = [c for c in gdf.columns
+                 if c != "geometry" and gdf[c].dtype == "object"]
+    if text_cols:
+        return text_cols[0]
+    gdf["ti_name_auto"] = [f"TI_{i+1:02d}" for i in range(len(gdf))]
+    return "ti_name_auto"
+
+def prepare_boundaries():
+    global TI_VECTOR_PATH
+
+    # 1. Se nenhum caminho foi definido, tenta baixar automaticamente
+    if TI_VECTOR_PATH is None:
+        console.print("[yellow]TI_VECTOR_PATH não definido — tentando download automático...[/yellow]")
+        try:
+            downloaded = download_terras_indigenas(filter_cerrado=True)
+            TI_VECTOR_PATH = str(downloaded)
+            console.print(f"[green]✓ Download automático concluído:[/green] {TI_VECTOR_PATH}")
+        except Exception as download_err:
+            console.print(f"[red]Download automático falhou: {download_err}[/red]")
+            console.print("[yellow]Tentando auto-detecção de arquivo existente no Drive...[/yellow]")
+            try:
+                found = find_boundary_file()
+                TI_VECTOR_PATH = str(found)
+            except FileNotFoundError:
+                raise FileNotFoundError(
+                    "Não foi possível baixar nem encontrar um arquivo de Terras Indígenas.\n"
+                    "Opções:\n"
+                    "  1. Verifique sua conexão com a internet e rode novamente.\n"
+                    "  2. Faça upload manual de um .gpkg/.shp/.geojson para:\n"
+                    f"     {DIRS['raw']}\n"
+                    "  3. Defina TI_VECTOR_PATH manualmente no início do script."
+                )
+
+    vector_path = Path(TI_VECTOR_PATH)
+    if not vector_path.exists():
+        raise FileNotFoundError(f"Arquivo não encontrado: {vector_path}")
+
+    console.print(f"[green]✓ Usando arquivo de limites:[/green] {vector_path}")
+
+    gdf = gpd.read_file(vector_path)
+    gdf = gdf[gdf.geometry.notnull()].copy()
+
+    if gdf.empty:
+        raise ValueError("O arquivo foi lido, mas não contém geometrias válidas.")
+
+    if gdf.crs is None:
+        console.print("[yellow]Aviso: CRS ausente. Assumindo EPSG:4326.[/yellow]")
+        gdf = gdf.set_crs("EPSG:4326")
+    gdf = gdf.to_crs("EPSG:4326")
+
+    name_field = detect_name_field(gdf)
+    console.print(f"[green]✓ Campo de nome detectado:[/green] {name_field}")
+
+    gdf["ti_name"] = gdf[name_field].astype(str)
+    gdf["ti_id"]   = np.arange(1, len(gdf) + 1)
+    gdf["geometry"] = gdf.geometry.buffer(0)
+    gdf = gdf[~gdf.geometry.is_empty].copy()
+
+    gdf_area = gdf.to_crs(AREA_CRS)
+    gdf["area_ha"]  = gdf_area.geometry.area / 10_000
+    gdf["area_km2"] = gdf_area.geometry.area / 1_000_000
+
+    study_area = gdf.dissolve()
+    study_area["name"] = "study_area_indigenous_lands"
+
+    out_ti   = DIRS["boundaries"] / "study_tis_cerrado.gpkg"
+    out_area = DIRS["boundaries"] / "study_area_dissolved.gpkg"
+
+    gdf.to_file(out_ti, driver="GPKG")
+    study_area.to_file(out_area, driver="GPKG")
+    gdf.to_file(DIRS["boundaries"] / "study_tis_cerrado.geojson",   driver="GeoJSON")
+    study_area.to_file(DIRS["boundaries"] / "study_area_dissolved.geojson", driver="GeoJSON")
+
+    console.print(f"[green]✓ Terras Indígenas salvas:[/green] {out_ti}")
+    console.print(f"[green]✓ Área de estudo dissolvida:[/green] {out_area}")
+
+    return gdf, study_area
+
+tis, study_area = prepare_boundaries()
+
+# ============================================================
+# 7b. FILTRA TIs DENTRO DO BIOMA CERRADO
+# ============================================================
+
+def filter_tis_by_biome(tis: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
+    """
+    Filtra as TIs que intersectam o limite do bioma Cerrado.
+    Usa o arquivo biome_border.shp em 00_raw/.
+    """
+    biome_path = DIRS["raw"] / "biome_border.shp"
+
+    if not biome_path.exists():
+        console.print("[yellow]⚠ biome_border.shp não encontrado — usando todas as TIs.[/yellow]")
+        return tis
+
+    console.print(f"[yellow]→ Carregando limite do Cerrado: {biome_path.name}[/yellow]")
+    cerrado = gpd.read_file(biome_path)
+
+    # Garante mesmo CRS
+    cerrado = cerrado.to_crs("EPSG:4326")
+
+    # Dissolve em uma geometria única
+    cerrado_union = cerrado.dissolve()
+
+    # Filtra TIs que intersectam o Cerrado
+    n_before = len(tis)
+    tis_cerrado = tis[tis.geometry.intersects(cerrado_union.geometry.iloc[0])].copy()
+    n_after = len(tis_cerrado)
+
+    console.print(
+        f"[green]✓ TIs filtradas pelo Cerrado:[/green] "
+        f"{n_before} → {n_after} TIs "
+        f"({n_before - n_after} removidas)"
+    )
+
+    # Salva fronteira do Cerrado para uso posterior
+    cerrado_union.to_file(DIRS["boundaries"] / "cerrado_border.gpkg", driver="GPKG")
+
+    return tis_cerrado.reset_index(drop=True)
+
+
+tis = filter_tis_by_biome(tis)
+
+# Recalcula ti_id sequencial após filtro
+tis["ti_id"] = np.arange(1, len(tis) + 1)
+
+# Salva TIs filtradas
+tis.to_file(DIRS["boundaries"] / "study_tis_cerrado.gpkg",    driver="GPKG")
+tis.to_file(DIRS["boundaries"] / "study_tis_cerrado.geojson", driver="GeoJSON")
+console.print(f"[green]✓ TIs do Cerrado salvas:[/green] {len(tis)} TIs")
+
+# Reconstrói study_area com TIs filtradas
+study_area = tis.dissolve()
+study_area["name"] = "study_area_indigenous_lands"
+study_area.to_file(DIRS["boundaries"] / "study_area_dissolved.gpkg",    driver="GPKG")
+study_area.to_file(DIRS["boundaries"] / "study_area_dissolved.geojson", driver="GeoJSON")
+
+# ============================================================
+# 9. CONVERTER LIMITES PARA EE FEATURECOLLECTION
+# ============================================================
+
+def gdf_to_ee_fc(gdf):
+    features = []
+    for _, row in tqdm(gdf.iterrows(), total=len(gdf), desc="Convertendo TIs para EE"):
+        geom_json = json.loads(
+            gpd.GeoSeries([row.geometry], crs="EPSG:4326").to_json()
+        )["features"][0]["geometry"]
+
+        feat = ee.Feature(
+            ee.Geometry(geom_json),
+            {
+                "ti_id":    int(row["ti_id"]),
+                "ti_name":  str(row["ti_name"]),
+                "area_ha":  float(row["area_ha"]),
+                "area_km2": float(row["area_km2"]),
+            }
+        )
+        features.append(feat)
+    return ee.FeatureCollection(features)
+
+tis_ee = gdf_to_ee_fc(tis)
+
+# ============================================================
+# 10. METADADOS E RESUMO
+# ============================================================
+
+metadata = {
+    "project":            PROJECT_NAME,
+    "created_at":         str(datetime.now()),
+    "force_reprocess":    FORCE_REPROCESS,
+    "start_year":         START_YEAR,
+    "transition_year":    TRANSITION_YEAR,
+    "end_year":           END_YEAR,
+    "pre_period":         PRE_PERIOD,
+    "post_period":        POST_PERIOD,
+    "dry_months":         DRY_MONTHS,
+    "wet_months":         WET_MONTHS,
+    "n_indigenous_lands": int(len(tis)),
+    "total_area_ha":      float(tis["area_ha"].sum()),
+    "total_area_km2":     float(tis["area_km2"].sum()),
+    "ti_names":           tis["ti_name"].tolist(),
+}
+
+save_json(metadata, DIRS["logs"] / "project_metadata.json")
+
+summary = Table(title="Resumo da área de estudo")
+summary.add_column("Item")
+summary.add_column("Valor")
+
+summary.add_row("Terras Indígenas",  str(len(tis)))
+summary.add_row("Área total (ha)",   f"{tis['area_ha'].sum():,.1f}")
+summary.add_row("Área total (km²)",  f"{tis['area_km2'].sum():,.1f}")
+summary.add_row("Período",           f"{START_YEAR}–{END_YEAR}")
+summary.add_row("Pré-BRIF",          f"{PRE_PERIOD[0]}–{PRE_PERIOD[1]}")
+summary.add_row("Transição",         str(TRANSITION_YEAR))
+summary.add_row("Pós-BRIF",         f"{POST_PERIOD[0]}–{POST_PERIOD[1]}")
+summary.add_row("Pasta do projeto",  str(PROJECT_ROOT))
+
+console.print(summary)
+console.print("[bold green]✓ BLOCK 0 concluído com sucesso.[/bold green]")

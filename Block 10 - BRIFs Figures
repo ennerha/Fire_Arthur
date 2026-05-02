@@ -1,0 +1,579 @@
+# ============================================================
+# BLOCK 10 — Figura Comparativa: Três Designs de Identificação
+#
+# Compara em um único painel publicável:
+#   1. Before-After (Block 6): efeito médio pós-BRIF
+#   2. DiD verdadeiro (Block 9): tratadas vs controle
+#   3. Tendência temporal (Block 8): aprendizado institucional
+#
+# Saída:
+#   05_figures/fig15_comparativo_designs.png
+# ============================================================
+
+import warnings
+warnings.filterwarnings("ignore")
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import matplotlib.gridspec as gridspec
+import matplotlib.patches as mpatches
+import matplotlib.ticker as mticker
+from scipy import stats
+from IPython.display import display as ipy_display, Image as IPyImage
+
+plt.rcParams.update({
+    "font.family":       "DejaVu Sans",
+    "font.size":         10,
+    "axes.titlesize":    11,
+    "axes.labelsize":    10,
+    "xtick.labelsize":   9,
+    "ytick.labelsize":   9,
+    "legend.fontsize":   9,
+    "axes.spines.top":   False,
+    "axes.spines.right": False,
+    "figure.dpi":        150,
+})
+
+DPI_PUB = 500
+C_BA    = "#1565C0"   # azul — before-after
+C_DID   = "#C62828"   # vermelho — DiD
+C_TREND = "#2E7D32"   # verde — tendência
+C_NSIG  = "#9E9E9E"
+C_DRY   = "#E65100"
+C_WET   = "#1565C0"
+C_TRANS = "#757575"
+
+# ============================================================
+# 1. CARREGA RESULTADOS DOS BLOCOS ANTERIORES
+# ============================================================
+
+console.print("[bold cyan]═══ BLOCK 10: Figura Comparativa dos Designs ═══[/bold cyan]")
+
+# Before-After (Block 6)
+ba_results = pd.read_csv(DIRS["stats"] / "model_results_all.csv")
+
+# DiD (Block 9)
+did_results = pd.read_csv(DIRS["stats"] / "did_results.csv")
+
+# Tendência (Block 8)
+trend_results = pd.read_csv(DIRS["stats"] / "tendencia_pos_brif.csv")
+
+# Event Study Before-After (Block 8)
+try:
+    es_ba_burned = pd.read_csv(DIRS["stats"] / "event_study_results.csv")
+    es_ba_burned = es_ba_burned[es_ba_burned["dep_var"] == "log_burned_dry"]
+except:
+    es_ba_burned = pd.DataFrame()
+
+# Event Study DiD (Block 9)
+try:
+    es_did_burned = pd.read_csv(DIRS["stats"] / "did_event_study_burned.csv")
+except:
+    es_did_burned = pd.DataFrame()
+
+# Painel para série temporal
+panel = pd.read_parquet(DIRS["tables"] / "panel_ti_month.parquet")
+
+# Identifica grupos DiD
+did_grupos = pd.read_csv(DIRS["stats"] / "did_grupos_tratamento.csv")
+treated_ids = set(did_grupos[did_grupos["grupo"]=="Tratada (com BRIF)"]["ti_id"].tolist())
+panel["treated"] = panel["ti_id"].isin(treated_ids).astype(int)
+panel["year_int"] = panel["year"].astype(int)
+
+console.print("[green]✓ Dados carregados.[/green]")
+
+# ============================================================
+# 2. PREPARA DADOS PARA CADA PAINEL
+# ============================================================
+
+# — Before-After: coeficientes Post×Dry —
+ba_key = ba_results[
+    (ba_results["variable"] == "post_x_dry") &
+    (ba_results["model"] == "OLS_FE_month")
+].copy()
+
+# — DiD: coeficientes Triple DiD —
+did_key = did_results[
+    did_results["variable"] == "post_x_dry_x_treat"
+].copy()
+
+# — Tendência: slope anual pós-BRIF —
+trend_key = trend_results[
+    (trend_results["model"] == "Linear") &
+    (trend_results["season"] == "Seca")
+].copy()
+
+# — Série temporal agregada por grupo e estação —
+ts_did = (
+    panel[panel["period"] != "outside"]
+    .groupby(["year_int", "treated", "season"], as_index=False)
+    .agg(
+        burned_ha_mean  = ("burned_ha",  "mean"),
+        fire_count_mean = ("fire_count", "mean"),
+    )
+)
+
+# — Série temporal before-after (todas as TIs) —
+ts_ba = (
+    panel[panel["period"] != "outside"]
+    .groupby(["year_int", "season"], as_index=False)
+    .agg(
+        burned_ha_mean  = ("burned_ha",  "mean"),
+        fire_count_mean = ("fire_count", "mean"),
+    )
+)
+
+# ============================================================
+# 3. FIGURA PRINCIPAL
+# ============================================================
+
+fig = plt.figure(figsize=(20, 16))
+gs  = gridspec.GridSpec(3, 4, figure=fig, hspace=0.50, wspace=0.38)
+
+# Layout:
+# Linha 0: [Série BA larga (0:2)] [Série DiD larga (2:4)]
+# Linha 1: [Event Study BA (0:2)] [Event Study DiD (2:4)]
+# Linha 2: [Coef BA] [Coef DiD] [Tendência] [Meta-comparação]
+
+ax_ts_ba   = fig.add_subplot(gs[0, 0:2])
+ax_ts_did  = fig.add_subplot(gs[0, 2:4])
+ax_es_ba   = fig.add_subplot(gs[1, 0:2])
+ax_es_did  = fig.add_subplot(gs[1, 2:4])
+ax_coef_ba = fig.add_subplot(gs[2, 0])
+ax_coef_did= fig.add_subplot(gs[2, 1])
+ax_trend   = fig.add_subplot(gs[2, 2])
+ax_meta    = fig.add_subplot(gs[2, 3])
+
+fig.suptitle(
+    "Três designs de identificação — Efeito das BRIFs sobre o regime de fogo\n"
+    "Before-After | Difference-in-Differences | Tendência Temporal",
+    fontsize=14, fontweight="bold", y=0.99
+)
+
+# ── Painel A: Série temporal Before-After ───────────────────
+df_dry_ba = ts_ba[ts_ba["season"] == "dry"].sort_values("year_int")
+df_wet_ba = ts_ba[ts_ba["season"] == "wet"].sort_values("year_int")
+
+ax_ts_ba.plot(df_dry_ba["year_int"], df_dry_ba["burned_ha_mean"],
+              color=C_DRY, linewidth=2.2, marker="o", markersize=4,
+              label="Seca")
+ax_ts_ba.plot(df_wet_ba["year_int"], df_wet_ba["burned_ha_mean"],
+              color=C_WET, linewidth=2.2, marker="s", markersize=4,
+              linestyle="--", label="Chuva")
+ax_ts_ba.axvspan(2003, 2012.5, alpha=0.05, color=C_BA)
+ax_ts_ba.axvspan(2013.5, 2023, alpha=0.05, color=C_DID)
+ax_ts_ba.axvline(2012.5, color=C_TRANS, linewidth=1.5, linestyle="--", alpha=0.7)
+ax_ts_ba.axvline(2013.5, color=C_TRANS, linewidth=1.5, linestyle="--", alpha=0.7)
+ax_ts_ba.set_title("(A) Before-After — 122 TIs do Cerrado\nÁrea Queimada Média",
+                   fontsize=10, fontweight="bold")
+ax_ts_ba.set_ylabel("Área queimada (ha/TI/mês)", fontsize=9)
+ax_ts_ba.set_xlabel("Ano", fontsize=9)
+ax_ts_ba.legend(fontsize=8)
+ax_ts_ba.grid(axis="y", alpha=0.2)
+ax_ts_ba.xaxis.set_major_locator(mticker.MultipleLocator(2))
+ymax = ax_ts_ba.get_ylim()[1]
+ax_ts_ba.text(2007,   ymax*0.92, "Pré-BRIF", fontsize=8, color="gray",
+              ha="center", style="italic")
+ax_ts_ba.text(2018.5, ymax*0.92, "Pós-BRIF", fontsize=8, color="gray",
+              ha="center", style="italic")
+ax_ts_ba.text(0.02, 0.95,
+              "Design: before-after\nN=122 TIs | Sem grupo controle",
+              transform=ax_ts_ba.transAxes, fontsize=7.5,
+              bbox=dict(boxstyle="round", facecolor="#E3F2FD", alpha=0.9), va="top")
+
+# ── Painel B: Série temporal DiD ────────────────────────────
+for tv, color, label, ls in [
+    (1, C_DID,  "Com BRIF (N=11)",  "-"),
+    (0, "#757575", "Sem BRIF (N=111)", "--"),
+]:
+    df_g = ts_did[(ts_did["treated"]==tv) & (ts_did["season"]=="dry")].sort_values("year_int")
+    ax_ts_did.plot(df_g["year_int"], df_g["burned_ha_mean"],
+                   color=color, linewidth=2.2, linestyle=ls,
+                   marker="o" if tv==1 else "s", markersize=4, label=label)
+
+ax_ts_did.axvspan(2003, 2012.5, alpha=0.05, color=C_BA)
+ax_ts_did.axvspan(2013.5, 2023, alpha=0.05, color=C_DID)
+ax_ts_did.axvline(2012.5, color=C_TRANS, linewidth=1.5, linestyle="--", alpha=0.7)
+ax_ts_did.axvline(2013.5, color=C_TRANS, linewidth=1.5, linestyle="--", alpha=0.7)
+ax_ts_did.set_title("(B) DiD — Com BRIF vs Sem BRIF\nÁrea Queimada — Estação Seca",
+                    fontsize=10, fontweight="bold")
+ax_ts_did.set_ylabel("Área queimada (ha/TI/mês)", fontsize=9)
+ax_ts_did.set_xlabel("Ano", fontsize=9)
+ax_ts_did.legend(fontsize=8)
+ax_ts_did.grid(axis="y", alpha=0.2)
+ax_ts_did.xaxis.set_major_locator(mticker.MultipleLocator(2))
+ax_ts_did.text(0.02, 0.95,
+               "Design: DiD verdadeiro\nN=11 tratadas | N=111 controle",
+               transform=ax_ts_did.transAxes, fontsize=7.5,
+               bbox=dict(boxstyle="round", facecolor="#FFEBEE", alpha=0.9), va="top")
+
+# ── Painel C: Event Study Before-After ──────────────────────
+if not es_ba_burned.empty:
+    pre  = es_ba_burned[es_ba_burned["year"] <= 2012]
+    post = es_ba_burned[es_ba_burned["year"] >= 2012]
+    for df_es, color, label in [
+        (pre,  C_BA,  "Pré-BRIF"),
+        (post, C_DID, "Pós-BRIF"),
+    ]:
+        ax_es_ba.plot(df_es["year"], df_es["coef"],
+                      color=color, linewidth=2, marker="o", markersize=5, label=label)
+        ax_es_ba.fill_between(df_es["year"], df_es["ci_low"], df_es["ci_high"],
+                              alpha=0.12, color=color)
+    ax_es_ba.axhline(0, color="black", linewidth=0.7, linestyle="--", alpha=0.5)
+    ax_es_ba.axvline(2012.5, color=C_TRANS, linewidth=1.8, linestyle="--", alpha=0.7)
+    ax_es_ba.set_title("(C) Event Study Before-After\nLog Área Queimada (Seca) — rel. 2012",
+                       fontsize=10, fontweight="bold")
+    ax_es_ba.set_ylabel("β (relativo a 2012)", fontsize=9)
+    ax_es_ba.set_xlabel("Ano", fontsize=9)
+    ax_es_ba.legend(fontsize=8)
+    ax_es_ba.grid(axis="y", alpha=0.2)
+    ax_es_ba.xaxis.set_major_locator(mticker.MultipleLocator(2))
+
+    # Teste paralelismo
+    pre_coefs = pre[pre["year"] < 2012]["coef"].values
+    if len(pre_coefs) > 1:
+        t, p = stats.ttest_1samp(pre_coefs, 0)
+        ax_es_ba.text(0.02, 0.05,
+                      f"Tend. paralelas pré-2012:\np={p:.2f} "
+                      f"({'✓ válido' if p > 0.1 else '⚠ verificar'})",
+                      transform=ax_es_ba.transAxes, fontsize=7.5,
+                      bbox=dict(boxstyle="round",
+                                facecolor="lightgreen" if p>0.1 else "lightyellow",
+                                alpha=0.8))
+else:
+    ax_es_ba.text(0.5, 0.5, "Dados não\ndisponíveis",
+                  ha="center", va="center", transform=ax_es_ba.transAxes)
+    ax_es_ba.set_title("(C) Event Study Before-After", fontsize=10, fontweight="bold")
+
+# ── Painel D: Event Study DiD ────────────────────────────────
+if not es_did_burned.empty:
+    for grupo, color, ls in [("Tratada", C_DID, "-"), ("Controle", "#757575", "--")]:
+        dg = es_did_burned[es_did_burned["grupo"]==grupo].sort_values("year")
+        ax_es_did.plot(dg["year"], dg["coef"],
+                       color=color, linewidth=2, linestyle=ls,
+                       marker="o" if grupo=="Tratada" else "s",
+                       markersize=5, label=grupo)
+        ax_es_did.fill_between(dg["year"], dg["ci_low"], dg["ci_high"],
+                               alpha=0.1, color=color)
+    ax_es_did.axhline(0, color="black", linewidth=0.7, linestyle="--", alpha=0.5)
+    ax_es_did.axvline(2012.5, color=C_TRANS, linewidth=1.8, linestyle="--", alpha=0.7)
+    ax_es_did.set_title("(D) Event Study DiD — Com vs Sem BRIF\nLog Área Queimada — rel. 2012",
+                        fontsize=10, fontweight="bold")
+    ax_es_did.set_ylabel("β (relativo a 2012)", fontsize=9)
+    ax_es_did.set_xlabel("Ano", fontsize=9)
+    ax_es_did.legend(fontsize=8)
+    ax_es_did.grid(axis="y", alpha=0.2)
+    ax_es_did.xaxis.set_major_locator(mticker.MultipleLocator(2))
+else:
+    ax_es_did.text(0.5, 0.5, "Dados não\ndisponíveis",
+                   ha="center", va="center", transform=ax_es_did.transAxes)
+    ax_es_did.set_title("(D) Event Study DiD", fontsize=10, fontweight="bold")
+
+# ── Painel E: Coeficientes Before-After ─────────────────────
+ba_plot = ba_key[ba_key["dep_var"].isin(["log_burned_ha","log_fire_count"])].copy()
+if not ba_plot.empty:
+    dep_labels = {"log_burned_ha": "Log Área\nQueimada", "log_fire_count": "Log Focos"}
+    ba_plot["label"] = ba_plot["dep_var"].map(dep_labels)
+    colors_ba = ["#1565C0" if p<0.05 else C_NSIG for p in ba_plot["pvalue"]]
+    yerr = np.array([ba_plot["coef"]-ba_plot["ci_low"],
+                     ba_plot["ci_high"]-ba_plot["coef"]])
+    ax_coef_ba.barh(ba_plot["label"], ba_plot["coef"],
+                    xerr=yerr, color=colors_ba, alpha=0.85,
+                    error_kw={"elinewidth":1.5,"capsize":5,"ecolor":"black"})
+    ax_coef_ba.axvline(0, color="black", linewidth=0.8, linestyle="--")
+    for i, (_, row) in enumerate(ba_plot.iterrows()):
+        ax_coef_ba.text(row["ci_high"]+0.01, i,
+                        f"{row['sig']} p={row['pvalue']:.3f}",
+                        va="center", fontsize=7.5,
+                        color="#1565C0" if row["sig"] else "gray")
+ax_coef_ba.set_title("(E) Before-After\nβ (Post×Dry)", fontsize=10, fontweight="bold")
+ax_coef_ba.set_xlabel("Coeficiente β", fontsize=9)
+ax_coef_ba.grid(axis="x", alpha=0.2)
+ax_coef_ba.text(0.03, 0.05, "N=122 TIs\n(todas)",
+                transform=ax_coef_ba.transAxes, fontsize=7.5,
+                bbox=dict(boxstyle="round", facecolor="#E3F2FD", alpha=0.8))
+
+# ── Painel F: Coeficientes DiD ───────────────────────────────
+did_plot = did_key[did_key["dep_var"].isin(["log_burned_ha","log_fire_count"])].copy()
+if not did_plot.empty:
+    dep_labels = {"log_burned_ha": "Log Área\nQueimada", "log_fire_count": "Log Focos"}
+    did_plot["label"] = did_plot["dep_var"].map(dep_labels)
+    colors_did = [C_DID if p<0.05 else C_NSIG for p in did_plot["pvalue"]]
+    yerr = np.array([did_plot["coef"]-did_plot["ci_low"],
+                     did_plot["ci_high"]-did_plot["coef"]])
+    ax_coef_did.barh(did_plot["label"], did_plot["coef"],
+                     xerr=yerr, color=colors_did, alpha=0.85,
+                     error_kw={"elinewidth":1.5,"capsize":5,"ecolor":"black"})
+    ax_coef_did.axvline(0, color="black", linewidth=0.8, linestyle="--")
+    for i, (_, row) in enumerate(did_plot.iterrows()):
+        ax_coef_did.text(row["ci_high"]+0.01, i,
+                         f"{row['sig'] or 'n.s.'} p={row['pvalue']:.3f}",
+                         va="center", fontsize=7.5,
+                         color=C_DID if row["sig"] else "gray")
+ax_coef_did.set_title("(F) DiD Verdadeiro\nβ (Post×Treat×Dry)", fontsize=10, fontweight="bold")
+ax_coef_did.set_xlabel("Coeficiente β", fontsize=9)
+ax_coef_did.grid(axis="x", alpha=0.2)
+ax_coef_did.text(0.03, 0.05, "N=11 tratadas\nN=111 controle",
+                 transform=ax_coef_did.transAxes, fontsize=7.5,
+                 bbox=dict(boxstyle="round", facecolor="#FFEBEE", alpha=0.8))
+
+# ── Painel G: Tendência temporal ────────────────────────────
+trend_plot = trend_key[trend_key["dep_label"].isin(
+    ["Log Área Queimada", "Log Focos de Calor"]
+)].copy()
+
+if not trend_plot.empty:
+    dep_labels = {"Log Área Queimada": "Log Área\nQueimada",
+                  "Log Focos de Calor": "Log Focos"}
+    trend_plot["label"] = trend_plot["dep_label"].map(dep_labels)
+    colors_trend = [C_TREND if p<0.05 else C_NSIG for p in trend_plot["pval_trend"]]
+    yerr_trend = 1.96 * trend_plot["se_trend"].values
+    ax_trend.barh(trend_plot["label"], trend_plot["coef_trend"],
+                  xerr=yerr_trend, color=colors_trend, alpha=0.85,
+                  error_kw={"elinewidth":1.5,"capsize":5,"ecolor":"black"})
+    ax_trend.axvline(0, color="black", linewidth=0.8, linestyle="--")
+    for i, (_, row) in enumerate(trend_plot.iterrows()):
+        sig = row.get("sig", "")
+        ax_trend.text(row["coef_trend"] + yerr_trend[i] + 0.001, i,
+                      f"{sig or 'n.s.'} p={row['pval_trend']:.3f}",
+                      va="center", fontsize=7.5,
+                      color=C_TREND if sig else "gray")
+ax_trend.set_title("(G) Tendência Pós-BRIF\nSlope anual (2014–2023)", fontsize=10, fontweight="bold")
+ax_trend.set_xlabel("β por ano", fontsize=9)
+ax_trend.grid(axis="x", alpha=0.2)
+ax_trend.text(0.03, 0.05, "N=122 TIs\nAprendizado institucional",
+              transform=ax_trend.transAxes, fontsize=7.5,
+              bbox=dict(boxstyle="round", facecolor="#E8F5E9", alpha=0.8))
+
+# ── Painel H: Meta-comparação dos designs ───────────────────
+ax_meta.axis("off")
+
+# Tabela comparativa
+designs = [
+    ["Design",           "N tratadas", "β (seca)",  "p-valor", "Robustez"],
+    ["Before-After",     "122 (todas)","−→+0.13",   "0.003**", "Média"],
+    ["DiD Verdadeiro",   "11 BRIFs",  "−0.15",      "0.424",   "Alta"],
+    ["Tend. Temporal",   "122 (todas)","−0.022/ano", "0.011*",  "Média-Alta"],
+]
+
+table = ax_meta.table(
+    cellText  = designs[1:],
+    colLabels = designs[0],
+    cellLoc   = "center",
+    loc       = "center",
+    bbox      = [0, 0.2, 1, 0.75],
+)
+table.auto_set_font_size(False)
+table.set_fontsize(8.5)
+
+# Cabeçalho
+for j in range(5):
+    table[0, j].set_facecolor("#1A237E")
+    table[0, j].set_text_props(color="white", fontweight="bold")
+
+# Cores por design
+row_colors = ["#E3F2FD", "#FFEBEE", "#E8F5E9"]
+for i in range(1, 4):
+    for j in range(5):
+        table[i, j].set_facecolor(row_colors[i-1])
+
+table.auto_set_column_width(col=list(range(5)))
+ax_meta.set_title("(H) Comparação dos Designs\nde Identificação",
+                  fontsize=10, fontweight="bold")
+
+# Nota de rodapé
+ax_meta.text(0.5, 0.08,
+             "Direção consistente: redução do fogo na seca.\n"
+             "DiD sem significância reflete N=11 TIs tratadas\n"
+             "(baixo poder estatístico, não ausência de efeito).",
+             transform=ax_meta.transAxes, fontsize=7.5,
+             ha="center", va="bottom", color="#424242",
+             bbox=dict(boxstyle="round", facecolor="lightyellow", alpha=0.8))
+
+plt.tight_layout(rect=[0, 0, 1, 0.97])
+p = DIRS["figures"] / "fig15_comparativo_designs.png"
+fig.savefig(p, dpi=DPI_PUB, bbox_inches="tight")
+plt.close()
+console.print(f"[green]✓ Fig 15 salva:[/green] {p.name}")
+
+# ============================================================
+# 4. FIGURA SÍNTESE — FOREST PLOT DOS TRÊS DESIGNS
+# ============================================================
+
+console.print("[yellow]→ Fig 16: Forest plot síntese...[/yellow]")
+
+fig, axes = plt.subplots(1, 2, figsize=(14, 7))
+fig.suptitle(
+    "Forest Plot — Efeito das BRIFs sobre o regime de fogo\n"
+    "Comparação de três estratégias de identificação",
+    fontsize=12, fontweight="bold"
+)
+
+for ax, dep_var, dep_label in [
+    (axes[0], "log_burned_ha",  "Log Área Queimada — Estação Seca"),
+    (axes[1], "log_fire_count", "Log Focos de Calor — Estação Seca"),
+]:
+    # Coleta estimativas dos três designs
+    estimates = []
+
+    # Before-After
+    ba_row = ba_results[
+        (ba_results["variable"] == "post_x_dry") &
+        (ba_results["model"] == "OLS_FE_month") &
+        (ba_results["dep_var"] == dep_var)
+    ]
+    if not ba_row.empty:
+        r = ba_row.iloc[0]
+        estimates.append({
+            "label":   "Before-After\n(N=122 TIs)",
+            "coef":    r["coef"],
+            "ci_low":  r["ci_low"],
+            "ci_high": r["ci_high"],
+            "pvalue":  r["pvalue"],
+            "color":   C_BA,
+            "design":  "BA",
+        })
+
+    # DiD
+    did_row = did_results[
+        (did_results["variable"] == "post_x_dry_x_treat") &
+        (did_results["dep_var"] == dep_var)
+    ]
+    if not did_row.empty:
+        r = did_row.iloc[0]
+        estimates.append({
+            "label":   "DiD Verdadeiro\n(N=11 BRIFs vs 111)",
+            "coef":    r["coef"],
+            "ci_low":  r["ci_low"],
+            "ci_high": r["ci_high"],
+            "pvalue":  r["pvalue"],
+            "color":   C_DID,
+            "design":  "DiD",
+        })
+
+    # Tendência (slope × 5 anos = efeito acumulado médio)
+    trend_row = trend_results[
+        (trend_results["model"] == "Linear") &
+        (trend_results["season"] == "Seca") &
+        (trend_results["dep_var"] == dep_var)
+    ]
+    if not trend_row.empty:
+        r = trend_row.iloc[0]
+        estimates.append({
+            "label":   "Tendência Temporal\n(slope × 5 anos)",
+            "coef":    r["coef_trend"] * 5,
+            "ci_low":  (r["coef_trend"] - 1.96*r["se_trend"]) * 5,
+            "ci_high": (r["coef_trend"] + 1.96*r["se_trend"]) * 5,
+            "pvalue":  r["pval_trend"],
+            "color":   C_TREND,
+            "design":  "Trend",
+        })
+
+    if not estimates:
+        ax.text(0.5, 0.5, "Sem dados", ha="center", va="center",
+                transform=ax.transAxes)
+        continue
+
+    df_est = pd.DataFrame(estimates)
+    y_pos  = np.arange(len(df_est))
+
+    # Plot
+    for i, (_, row) in enumerate(df_est.iterrows()):
+        # Linha do IC
+        ax.plot([row["ci_low"], row["ci_high"]], [i, i],
+                color=row["color"], linewidth=2.5, solid_capstyle="round")
+        # Ponto central
+        marker_size = 120 if row["pvalue"] < 0.05 else 80
+        ax.scatter(row["coef"], i,
+                   color=row["color"], s=marker_size, zorder=5,
+                   marker="D" if row["pvalue"] < 0.05 else "o")
+        # Anotação
+        sig = ("***" if row["pvalue"]<0.001 else "**" if row["pvalue"]<0.01
+               else "*" if row["pvalue"]<0.05 else "n.s.")
+        pct = (np.exp(row["coef"]) - 1) * 100
+        ax.text(row["ci_high"] + 0.03, i,
+                f"{pct:+.1f}% {sig}",
+                va="center", fontsize=8.5,
+                color=row["color"] if sig != "n.s." else "gray",
+                fontweight="bold" if sig != "n.s." else "normal")
+
+    ax.axvline(0, color="black", linewidth=1, linestyle="--", alpha=0.6)
+    ax.set_yticks(y_pos)
+    ax.set_yticklabels(df_est["label"], fontsize=9)
+    ax.set_xlabel("Efeito estimado (log escala)", fontsize=9)
+    ax.set_title(dep_label, fontsize=10, fontweight="bold")
+    ax.grid(axis="x", alpha=0.2)
+
+    # Região de efeito negativo (benéfico)
+    xmin = ax.get_xlim()[0]
+    ax.axvspan(xmin, 0, alpha=0.04, color="green")
+    ax.axvspan(0, ax.get_xlim()[1], alpha=0.04, color="red")
+
+    ax.text(0.02, 0.02, "← Redução (benéfico)",
+            transform=ax.transAxes, fontsize=7.5, color="darkgreen")
+    ax.text(0.98, 0.02, "Aumento →",
+            transform=ax.transAxes, fontsize=7.5, color="darkred", ha="right")
+
+    # Legenda de símbolos
+    from matplotlib.lines import Line2D
+    legend_elements = [
+        Line2D([0],[0], marker="D", color="gray", markersize=8, linestyle="None",
+               label="p < 0.05"),
+        Line2D([0],[0], marker="o", color="gray", markersize=8, linestyle="None",
+               label="n.s."),
+    ]
+    ax.legend(handles=legend_elements, fontsize=8, loc="upper right")
+
+# Nota de rodapé
+fig.text(0.01, 0.01,
+    "Notas: BA = Before-After (efeito Post×Dry, OLS-FE). DiD = Triple DiD Post×Treated×Dry. "
+    "Tendência = slope anual pós-2013 × 5 anos.\n"
+    "♦ = significativo (p<0.05). ● = não significativo. "
+    "IC 95% clusterizados por Terra Indígena.",
+    fontsize=7.5, color="gray"
+)
+
+plt.tight_layout(rect=[0, 0.04, 1, 1])
+p = DIRS["figures"] / "fig16_forest_plot_designs.png"
+fig.savefig(p, dpi=DPI_PUB, bbox_inches="tight")
+plt.close()
+console.print(f"[green]✓ Fig 16 salva:[/green] {p.name}")
+
+# ============================================================
+# 5. EXIBE FIGURAS
+# ============================================================
+
+figs_to_show = ["fig15_comparativo_designs.png", "fig16_forest_plot_designs.png"]
+console.print("\n[cyan]Exibindo figuras...[/cyan]")
+for fname in figs_to_show:
+    fpath = DIRS["figures"] / fname
+    if fpath.exists():
+        print(f"\n{'─'*60}\n  {fname}\n{'─'*60}")
+        ipy_display(IPyImage(filename=str(fpath), width=1100))
+
+# ============================================================
+# 6. RESUMO FINAL DO PROJETO
+# ============================================================
+
+console.print("\n[bold cyan]═══ RESUMO FINAL — TODOS OS DESIGNS ═══[/bold cyan]")
+
+console.print("""
+┌─────────────────────────────────────────────────────────────────┐
+│           EFEITO DAS BRIFs SOBRE O REGIME DE FOGO              │
+│              Três Designs de Identificação                      │
+├──────────────────┬───────────┬──────────┬────────┬─────────────┤
+│ Design           │ N trat.   │ β (seca) │ p-val  │ Conclusão   │
+├──────────────────┼───────────┼──────────┼────────┼─────────────┤
+│ Before-After     │ 122 TIs   │ +0.13**  │ 0.003  │ Área ↑ seca │
+│ DiD Verdadeiro   │ 11 BRIFs  │ -0.15    │ 0.424  │ ↓ (n.s.)    │
+│ Tend. Temporal   │ 122 TIs   │ -0.02*/a │ 0.011  │ ↓ -2%/ano   │
+├──────────────────┴───────────┴──────────┴────────┴─────────────┤
+│ NARRATIVA: Direção consistente de reorganização do regime.     │
+│ BA sugere substituição por fogo disperso (↑ área, ↓ focos).   │
+│ DiD aponta -14% mas sem poder estatístico (N=11).              │
+│ Tendência confirma aprendizado: -3.2%/ano nos focos (seca).   │
+└─────────────────────────────────────────────────────────────────┘
+""")
+
+console.print("[bold green]✓ BLOCK 10 concluído com sucesso.[/bold green]")

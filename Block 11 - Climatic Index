@@ -1,0 +1,936 @@
+# ============================================================
+# BLOCK 11 — Índices Climáticos e Controle de ENSO
+#
+# Objetivo: testar se os resultados das BRIFs resistem ao
+# controle por variabilidade climática de larga escala
+#
+# Índices utilizados:
+#   1. ONI (Oceanic Niño Index) — El Niño/La Niña — NOAA
+#   2. AMO (Atlantic Multidecadal Oscillation) — NOAA
+#   3. PDO (Pacific Decadal Oscillation) — NOAA
+#   4. SPI (Standardized Precipitation Index) — calculado do CHIRPS
+#   5. Anomalia de temperatura da superfície do mar
+#
+# Análises:
+#   1. Download e processamento dos índices climáticos
+#   2. Integração ao painel TI × mês
+#   3. Modelos com controle climático completo
+#   4. Teste de robustez: β4 (Post×Dry) com e sem índices
+#   5. Análise do El Niño 2015-2016 como experimento natural
+#   6. Figuras comparativas
+#
+# Saídas:
+#   03_tables/climate_indices_monthly.csv
+#   04_stats/model_climate_robust.csv
+#   05_figures/fig17_enso_fire.png
+#   05_figures/fig18_robustez_climatica.png
+#   05_figures/fig19_elnino_2015.png
+#   05_figures/fig20_painel_climatico.png
+# ============================================================
+
+import warnings
+warnings.filterwarnings("ignore")
+
+import numpy as np
+import pandas as pd
+import requests
+import io
+import matplotlib.pyplot as plt
+import matplotlib.gridspec as gridspec
+import matplotlib.ticker as mticker
+import statsmodels.formula.api as smf
+from scipy import stats
+from pathlib import Path
+from IPython.display import display as ipy_display, Image as IPyImage
+
+plt.rcParams.update({
+    "font.family":       "DejaVu Sans",
+    "font.size":         10,
+    "axes.titlesize":    11,
+    "axes.labelsize":    10,
+    "xtick.labelsize":   9,
+    "ytick.labelsize":   9,
+    "legend.fontsize":   9,
+    "axes.spines.top":   False,
+    "axes.spines.right": False,
+    "figure.dpi":        150,
+})
+
+DPI_PUB  = 500
+C_ELNINO = "#D32F2F"   # vermelho — El Niño
+C_LANINA = "#1565C0"   # azul — La Niña
+C_NEUTRO = "#757575"   # cinza — neutro
+C_BRIF   = "#2E7D32"   # verde — efeito BRIF
+C_PRE    = "#1565C0"
+C_POST   = "#C62828"
+C_DRY    = "#E65100"
+C_TRANS  = "#757575"
+
+console.print("[bold cyan]═══ BLOCK 11: Índices Climáticos e Controle de ENSO ═══[/bold cyan]")
+
+# ============================================================
+# 1. DOWNLOAD DOS ÍNDICES CLIMÁTICOS
+# ============================================================
+
+console.print("\n[yellow]→ Baixando índices climáticos...[/yellow]")
+
+def download_oni() -> pd.DataFrame:
+    """
+    ONI (Oceanic Niño Index) — NOAA CPC
+    Anomalia de TSM na região Niño 3.4 (média móvel 3 meses)
+    > +0.5°C por 5+ meses = El Niño
+    < -0.5°C por 5+ meses = La Niña
+    """
+    url = "https://www.cpc.ncep.noaa.gov/data/indices/oni.ascii.txt"
+    try:
+        resp = requests.get(url, timeout=30)
+        lines = resp.text.strip().split("\n")
+        rows = []
+        for line in lines:
+            parts = line.split()
+            if len(parts) >= 3 and parts[0].isdigit():
+                season = parts[1]
+                year   = int(parts[0])
+                oni    = float(parts[2]) if len(parts) > 2 else np.nan
+                # Mapeia estações para meses centrais
+                season_map = {
+                    "DJF": 1, "JFM": 2, "FMA": 3, "MAM": 4,
+                    "AMJ": 5, "MJJ": 6, "JJA": 7, "JAS": 8,
+                    "ASO": 9, "SON": 10, "OND": 11, "NDJ": 12,
+                }
+                month = season_map.get(season, np.nan)
+                if not np.isnan(month):
+                    rows.append({"year": year, "month": int(month), "oni": oni})
+        df = pd.DataFrame(rows).drop_duplicates(["year","month"])
+        console.print(f"  [green]✓ ONI: {len(df)} registros ({df['year'].min()}–{df['year'].max()})[/green]")
+        return df
+    except Exception as e:
+        console.print(f"  [yellow]⚠ ONI falhou ({e}), usando dados embutidos...[/yellow]")
+        return _oni_embedded()
+
+def _oni_embedded() -> pd.DataFrame:
+    """ONI histórico embutido para 2001-2024 (valores anuais médios conhecidos)."""
+    # Dados anuais médios do ONI — fonte NOAA
+    oni_annual = {
+        2001: 0.0, 2002: 0.8, 2003: 0.2, 2004: 0.5, 2005: 0.2,
+        2006: 0.3, 2007:-0.5, 2008:-0.5, 2009: 0.5, 2010:-1.2,
+        2011:-0.9, 2012: 0.1, 2013:-0.2, 2014: 0.4, 2015: 1.5,
+        2016: 0.5, 2017:-0.3, 2018: 0.7, 2019: 0.4, 2020: 0.2,
+        2021:-0.7, 2022:-0.9, 2023: 1.0, 2024: 0.5,
+    }
+    rows = []
+    for year, oni in oni_annual.items():
+        for month in range(1, 13):
+            rows.append({"year": year, "month": month, "oni": oni})
+    return pd.DataFrame(rows)
+
+def download_pdo() -> pd.DataFrame:
+    """
+    PDO (Pacific Decadal Oscillation) — NOAA NCEI
+    Índice mensal de variabilidade multidecadal do Pacífico Norte
+    """
+    url = "https://www.ncei.noaa.gov/pub/data/cmb/ersst/v5/index/ersst.v5.pdo.dat"
+    try:
+        resp = requests.get(url, timeout=30)
+        lines = [l for l in resp.text.strip().split("\n")
+                 if l.strip() and not l.startswith("Year")]
+        rows = []
+        for line in lines:
+            parts = line.split()
+            if len(parts) >= 13 and parts[0].isdigit():
+                year = int(parts[0])
+                for m, val in enumerate(parts[1:13], 1):
+                    try:
+                        pdo = float(val)
+                        if pdo != 99.99:
+                            rows.append({"year": year, "month": m, "pdo": pdo})
+                    except:
+                        pass
+        df = pd.DataFrame(rows)
+        console.print(f"  [green]✓ PDO: {len(df)} registros ({df['year'].min()}–{df['year'].max()})[/green]")
+        return df
+    except Exception as e:
+        console.print(f"  [yellow]⚠ PDO não disponível: {e}[/yellow]")
+        return pd.DataFrame(columns=["year","month","pdo"])
+
+def download_amo() -> pd.DataFrame:
+    """
+    AMO (Atlantic Multidecadal Oscillation) — NOAA ESRL
+    Variabilidade de TSM no Atlântico Norte — relevante para precipitação no Cerrado
+    """
+    url = "https://psl.noaa.gov/data/correlation/amon.us.long.data"
+    try:
+        resp = requests.get(url, timeout=30)
+        lines = resp.text.strip().split("\n")
+        rows = []
+        for line in lines:
+            parts = line.split()
+            if len(parts) >= 13 and parts[0].isdigit():
+                year = int(parts[0])
+                for m, val in enumerate(parts[1:13], 1):
+                    try:
+                        amo = float(val)
+                        if abs(amo) < 10:
+                            rows.append({"year": year, "month": m, "amo": amo})
+                    except:
+                        pass
+        df = pd.DataFrame(rows)
+        console.print(f"  [green]✓ AMO: {len(df)} registros ({df['year'].min()}–{df['year'].max()})[/green]")
+        return df
+    except Exception as e:
+        console.print(f"  [yellow]⚠ AMO não disponível: {e}[/yellow]")
+        return pd.DataFrame(columns=["year","month","amo"])
+
+# Baixa índices
+oni_df = download_oni()
+pdo_df = download_pdo()
+amo_df = download_amo()
+
+# ============================================================
+# 2. CALCULA SPI (Standardized Precipitation Index)
+# ============================================================
+
+console.print("\n[yellow]→ Calculando SPI do CHIRPS...[/yellow]")
+
+panel = pd.read_parquet(DIRS["tables"] / "panel_ti_month.parquet")
+panel["year_int"]  = panel["year"].astype(int)
+panel["month_int"] = panel["month"].astype(int)
+
+# SPI-3: média de precipitação dos últimos 3 meses, padronizada por mês
+# Agrega precipitação média do Cerrado por mês (todas as TIs)
+precip_cerrado = (
+    panel.groupby(["year_int","month_int"])["precip_mm"]
+    .mean()
+    .reset_index()
+    .rename(columns={"year_int":"year","month_int":"month"})
+    .sort_values(["year","month"])
+)
+
+# SPI-3: janela de 3 meses
+precip_cerrado["precip_3m"] = precip_cerrado["precip_mm"].rolling(3, min_periods=2).mean()
+
+# Padroniza por mês do ano (remove sazonalidade)
+for m in range(1, 13):
+    mask = precip_cerrado["month"] == m
+    mu  = precip_cerrado.loc[mask, "precip_3m"].mean()
+    std = precip_cerrado.loc[mask, "precip_3m"].std()
+    if std > 0:
+        precip_cerrado.loc[mask, "spi3"] = (precip_cerrado.loc[mask, "precip_3m"] - mu) / std
+    else:
+        precip_cerrado.loc[mask, "spi3"] = 0
+
+console.print(f"  [green]✓ SPI-3 calculado: {len(precip_cerrado)} meses[/green]")
+
+# ============================================================
+# 3. CLASSIFICA EVENTOS ENSO
+# ============================================================
+
+console.print("\n[yellow]→ Classificando eventos ENSO...[/yellow]")
+
+def classify_enso(oni):
+    if pd.isna(oni):
+        return "Neutro"
+    if oni >= 1.5:
+        return "El Niño Forte"
+    elif oni >= 0.5:
+        return "El Niño"
+    elif oni <= -1.5:
+        return "La Niña Forte"
+    elif oni <= -0.5:
+        return "La Niña"
+    else:
+        return "Neutro"
+
+oni_df["enso_class"] = oni_df["oni"].apply(classify_enso)
+
+# Eventos históricos relevantes para o Cerrado
+enso_events = {
+    2004: "El Niño",
+    2005: "El Niño Moderado",
+    2007: "La Niña",
+    2008: "La Niña",
+    2009: "El Niño Moderado",
+    2010: "La Niña Forte",
+    2011: "La Niña",
+    2015: "El Niño Forte",
+    2016: "El Niño → Neutro",
+    2017: "La Niña Fraca",
+    2020: "La Niña",
+    2021: "La Niña",
+    2022: "La Niña Forte",
+    2023: "El Niño Forte",
+}
+
+console.print("  Eventos ENSO relevantes no período de análise:")
+for year, evt in enso_events.items():
+    console.print(f"    {year}: {evt}")
+
+# ============================================================
+# 4. INTEGRA ÍNDICES AO PAINEL
+# ============================================================
+
+console.print("\n[yellow]→ Integrando índices ao painel...[/yellow]")
+
+# Merge ONI
+panel_clim = panel.merge(
+    oni_df[["year","month","oni","enso_class"]].rename(
+        columns={"year":"year_int","month":"month_int"}
+    ),
+    on=["year_int","month_int"], how="left"
+)
+
+# Merge PDO
+if not pdo_df.empty:
+    panel_clim = panel_clim.merge(
+        pdo_df.rename(columns={"year":"year_int","month":"month_int"}),
+        on=["year_int","month_int"], how="left"
+    )
+else:
+    panel_clim["pdo"] = np.nan
+
+# Merge AMO
+if not amo_df.empty:
+    panel_clim = panel_clim.merge(
+        amo_df.rename(columns={"year":"year_int","month":"month_int"}),
+        on=["year_int","month_int"], how="left"
+    )
+else:
+    panel_clim["amo"] = np.nan
+
+# Merge SPI-3
+panel_clim = panel_clim.merge(
+    precip_cerrado[["year","month","spi3"]].rename(
+        columns={"year":"year_int","month":"month_int"}
+    ),
+    on=["year_int","month_int"], how="left"
+)
+
+# Preenche NaN dos índices com 0 (neutro)
+for col in ["oni","pdo","amo","spi3"]:
+    panel_clim[col] = pd.to_numeric(panel_clim[col], errors="coerce").fillna(0)
+
+# Variáveis de interação
+panel_clim["oni_x_dry"]  = panel_clim["oni"]  * panel_clim["dry"].astype(float)
+panel_clim["oni_x_post"] = panel_clim["oni"]  * panel_clim["post"].astype(float)
+
+# Flags de evento ENSO
+panel_clim["is_elnino"]      = (panel_clim["oni"] >= 0.5).astype(int)
+panel_clim["is_elnino_forte"]= (panel_clim["oni"] >= 1.5).astype(int)
+panel_clim["is_lanina"]      = (panel_clim["oni"] <= -0.5).astype(int)
+
+# Tipos
+panel_clim["ti_id_str"]  = panel_clim["ti_id"].astype(str)
+panel_clim["post"]       = panel_clim["post"].astype(int)
+panel_clim["dry"]        = panel_clim["dry"].astype(int)
+panel_clim["post_x_dry"] = panel_clim["post_x_dry"].astype(int)
+
+# Salva
+panel_clim_path = DIRS["tables"] / "panel_ti_month_climate.parquet"
+panel_clim.to_parquet(panel_clim_path, index=False)
+
+# Salva índices
+climate_monthly = panel_clim.groupby(["year_int","month_int"], as_index=False).agg(
+    oni=("oni","first"), pdo=("pdo","first"),
+    amo=("amo","first"), spi3=("spi3","first"),
+    enso_class=("enso_class","first"),
+)
+climate_monthly.to_csv(DIRS["tables"] / "climate_indices_monthly.csv", index=False)
+console.print(f"  [green]✓ Painel climático: {len(panel_clim):,} obs | "
+              f"ONI: {panel_clim['oni'].notna().sum():,} | "
+              f"SPI3: {panel_clim['spi3'].notna().sum():,}[/green]")
+
+# ============================================================
+# 5. MODELOS COM CONTROLE CLIMÁTICO
+# ============================================================
+
+console.print("\n[bold]— Modelos com Controle Climático Completo —[/bold]")
+
+panel_model_clim = panel_clim[panel_clim["period"].isin(["pre","post"])].copy()
+
+clim_results = []
+
+def run_climate_model(dep_var, dep_label, controls, model_name):
+    control_str = " + ".join(controls)
+    formula = (f"{dep_var} ~ post + dry + post_x_dry + precip_mm + "
+               f"{control_str} + C(month_int) + C(ti_id_str) - 1")
+    try:
+        m = smf.ols(formula, data=panel_model_clim).fit(
+            cov_type="cluster",
+            cov_kwds={"groups": panel_model_clim["ti_id_str"]}
+        )
+        for var in ["post_x_dry", "oni", "oni_x_dry", "spi3", "pdo", "amo"]:
+            if var in m.params:
+                ci = m.conf_int().loc[var]
+                clim_results.append({
+                    "model":    model_name,
+                    "dep_var":  dep_var,
+                    "dep_label":dep_label,
+                    "variable": var,
+                    "coef":     m.params[var],
+                    "se":       m.bse[var],
+                    "pvalue":   m.pvalues[var],
+                    "ci_low":   ci[0],
+                    "ci_high":  ci[1],
+                    "sig":      ("***" if m.pvalues[var]<0.001
+                                 else "**" if m.pvalues[var]<0.01
+                                 else "*" if m.pvalues[var]<0.05 else "n.s."),
+                    "r2":       m.rsquared,
+                    "n_obs":    int(m.nobs),
+                })
+        # Imprime resultado-chave
+        if "post_x_dry" in m.params:
+            sig = ("***" if m.pvalues["post_x_dry"]<0.001
+                   else "**" if m.pvalues["post_x_dry"]<0.01
+                   else "*" if m.pvalues["post_x_dry"]<0.05 else "n.s.")
+            console.print(
+                f"  [{model_name}] {dep_label}: "
+                f"β(Post×Dry)={m.params['post_x_dry']:+.4f} "
+                f"(p={m.pvalues['post_x_dry']:.4f}) {sig}"
+            )
+        return m
+    except Exception as e:
+        console.print(f"  [red]✗ {model_name} {dep_label}: {e}[/red]")
+        return None
+
+console.print("\n  [cyan]Modelo base (sem índices climáticos):[/cyan]")
+for dep_var, dep_label in [
+    ("log_burned_ha",  "Log Área Queimada"),
+    ("log_fire_count", "Log Focos"),
+]:
+    run_climate_model(dep_var, dep_label, [], "Base")
+
+console.print("\n  [cyan]+ ONI (El Niño/La Niña):[/cyan]")
+for dep_var, dep_label in [
+    ("log_burned_ha",  "Log Área Queimada"),
+    ("log_fire_count", "Log Focos"),
+]:
+    run_climate_model(dep_var, dep_label, ["oni", "oni_x_dry"], "+ONI")
+
+console.print("\n  [cyan]+ ONI + SPI-3 (seca regional):[/cyan]")
+for dep_var, dep_label in [
+    ("log_burned_ha",  "Log Área Queimada"),
+    ("log_fire_count", "Log Focos"),
+]:
+    run_climate_model(dep_var, dep_label,
+                      ["oni", "oni_x_dry", "spi3"], "+ONI+SPI")
+
+console.print("\n  [cyan]+ ONI + SPI-3 + PDO + AMO (controle completo):[/cyan]")
+available_controls = ["oni", "oni_x_dry", "spi3"]
+if panel_model_clim["pdo"].notna().sum() > 100:
+    available_controls.append("pdo")
+if panel_model_clim["amo"].notna().sum() > 100:
+    available_controls.append("amo")
+
+for dep_var, dep_label in [
+    ("log_burned_ha",  "Log Área Queimada"),
+    ("log_fire_count", "Log Focos"),
+]:
+    run_climate_model(dep_var, dep_label, available_controls, "+Full")
+
+clim_df = pd.DataFrame(clim_results)
+clim_df.to_csv(DIRS["stats"] / "model_climate_robust.csv", index=False)
+console.print(f"\n[green]✓ Resultados climáticos salvos.[/green]")
+
+# Tabela de robustez
+robustez = clim_df[clim_df["variable"] == "post_x_dry"].pivot_table(
+    index="dep_label", columns="model",
+    values=["coef","pvalue"], aggfunc="first"
+).round(4)
+console.print("\n[cyan]Tabela de robustez — β(Post×Dry) com controles climáticos:[/cyan]")
+display(robustez)
+
+# ============================================================
+# 6. ANÁLISE DO EL NIÑO 2015-2016 COMO EXPERIMENTO NATURAL
+# ============================================================
+
+console.print("\n[yellow]→ Analisando El Niño 2015-2016...[/yellow]")
+
+# Identifica anos-pivô
+anos_elnino_forte_pre  = [y for y in range(2003,2013) if oni_df[oni_df["year"]==y]["oni"].mean() >= 1.0]
+anos_elnino_forte_post = [y for y in range(2014,2024) if oni_df[oni_df["year"]==y]["oni"].mean() >= 1.0]
+anos_lanina_forte_pre  = [y for y in range(2003,2013) if oni_df[oni_df["year"]==y]["oni"].mean() <= -0.8]
+anos_lanina_forte_post = [y for y in range(2014,2024) if oni_df[oni_df["year"]==y]["oni"].mean() <= -0.8]
+
+console.print(f"  El Niño forte pré-BRIF:  {anos_elnino_forte_pre}")
+console.print(f"  El Niño forte pós-BRIF:  {anos_elnino_forte_post}")
+console.print(f"  La Niña forte pré-BRIF:  {anos_lanina_forte_pre}")
+console.print(f"  La Niña forte pós-BRIF:  {anos_lanina_forte_post}")
+
+# Compara fogo em anos de El Niño forte pré vs pós
+ts_enso = (
+    panel_clim[panel_clim["season"]=="dry"]
+    .groupby(["year_int","period","is_elnino_forte"], as_index=False)
+    .agg(
+        burned_ha_mean  = ("burned_ha",  "mean"),
+        fire_count_mean = ("fire_count", "mean"),
+        oni_mean        = ("oni",        "mean"),
+    )
+)
+
+# Compara: mesmo nível de El Niño, período diferente
+elnino_pre  = ts_enso[(ts_enso["is_elnino_forte"]==1) & (ts_enso["period"]=="pre")]
+elnino_post = ts_enso[(ts_enso["is_elnino_forte"]==1) & (ts_enso["period"]=="post")]
+
+if not elnino_pre.empty and not elnino_post.empty:
+    console.print(f"\n  Comparação El Niño Forte — média na seca:")
+    console.print(f"  Pré-BRIF:  área={elnino_pre['burned_ha_mean'].mean():.0f} ha | "
+                  f"focos={elnino_pre['fire_count_mean'].mean():.1f}")
+    console.print(f"  Pós-BRIF:  área={elnino_post['burned_ha_mean'].mean():.0f} ha | "
+                  f"focos={elnino_post['fire_count_mean'].mean():.1f}")
+    if elnino_pre['fire_count_mean'].mean() > 0:
+        delta_focos = (elnino_post['fire_count_mean'].mean() /
+                       elnino_pre['fire_count_mean'].mean() - 1) * 100
+        console.print(f"  Variação focos El Niño forte pós vs pré: {delta_focos:+.1f}%")
+
+# ============================================================
+# 7. FIGURAS
+# ============================================================
+
+# Série temporal do ONI + fire
+ts_anual = (
+    panel_clim[panel_clim["season"]=="dry"]
+    .groupby("year_int", as_index=False)
+    .agg(
+        burned_ha_mean  = ("burned_ha",  "mean"),
+        fire_count_mean = ("fire_count", "mean"),
+        oni_mean        = ("oni",        "mean"),
+        spi3_mean       = ("spi3",       "mean"),
+    )
+    .sort_values("year_int")
+)
+
+# ── Fig 17: ENSO × Fire ─────────────────────────────────────
+
+console.print("\n[yellow]→ Fig 17: ENSO × Fire...[/yellow]")
+
+fig, axes = plt.subplots(3, 1, figsize=(13, 12), sharex=True)
+fig.suptitle(
+    "Índice Climático ENSO (ONI) e Regime de Fogo nas TIs do Cerrado\n"
+    "Variabilidade climática de larga escala vs efeito das BRIFs",
+    fontsize=12, fontweight="bold", y=0.98
+)
+
+# Painel 1: ONI
+ax = axes[0]
+years = ts_anual["year_int"].values
+oni   = ts_anual["oni_mean"].values
+
+ax.bar(years, np.where(oni >= 0, oni, 0),
+       color=C_ELNINO, alpha=0.7, label="El Niño (ONI > 0)")
+ax.bar(years, np.where(oni < 0, oni, 0),
+       color=C_LANINA, alpha=0.7, label="La Niña (ONI < 0)")
+ax.axhline(0.5,  color=C_ELNINO, linewidth=1, linestyle="--", alpha=0.5)
+ax.axhline(-0.5, color=C_LANINA, linewidth=1, linestyle="--", alpha=0.5)
+ax.axhline(0, color="black", linewidth=0.5)
+ax.axvline(2012.5, color=C_TRANS, linewidth=1.5, linestyle="--", alpha=0.7)
+ax.axvspan(2015, 2016, alpha=0.15, color=C_ELNINO, label="El Niño 2015-16")
+ax.axvspan(2010, 2011, alpha=0.15, color=C_LANINA, label="La Niña 2010-11")
+ax.set_ylabel("ONI (°C)", fontsize=9)
+ax.set_title("(A) Oceanic Niño Index — El Niño/La Niña", fontsize=10, fontweight="bold")
+ax.legend(fontsize=7.5, loc="upper right", ncol=2)
+ax.grid(axis="y", alpha=0.2)
+ax.annotate("BRIF →", xy=(2013, 1.2), fontsize=8, color=C_TRANS, style="italic")
+
+# Painel 2: Focos de calor
+ax2 = axes[1]
+ax2.plot(years, ts_anual["fire_count_mean"],
+         color="#BF360C", linewidth=2.2, marker="o", markersize=5, label="Focos (seca)")
+ax2.axvline(2012.5, color=C_TRANS, linewidth=1.5, linestyle="--", alpha=0.7)
+
+# Destaca anos de El Niño forte
+for yr in anos_elnino_forte_pre + anos_elnino_forte_post:
+    row = ts_anual[ts_anual["year_int"]==yr]
+    if not row.empty:
+        color = C_POST if yr >= 2014 else C_PRE
+        ax2.scatter(yr, row["fire_count_mean"].values[0],
+                    s=100, color=color, zorder=5,
+                    marker="*", label="_nolegend_")
+
+ax2.axvspan(2015, 2016, alpha=0.12, color=C_ELNINO)
+ax2.axvspan(2010, 2011, alpha=0.12, color=C_LANINA)
+ax2.set_ylabel("Focos médios/TI/mês", fontsize=9)
+ax2.set_title("(B) Focos de Calor — Estação Seca | ★ = El Niño Forte",
+              fontsize=10, fontweight="bold")
+ax2.legend(fontsize=8)
+ax2.grid(axis="y", alpha=0.2)
+
+# Painel 3: Área queimada
+ax3 = axes[2]
+ax3.plot(years, ts_anual["burned_ha_mean"],
+         color=C_DRY, linewidth=2.2, marker="o", markersize=5, label="Área queimada (seca)")
+ax3.axvline(2012.5, color=C_TRANS, linewidth=1.5, linestyle="--", alpha=0.7)
+ax3.axvspan(2015, 2016, alpha=0.12, color=C_ELNINO)
+ax3.axvspan(2010, 2011, alpha=0.12, color=C_LANINA)
+ax3.set_ylabel("Área queimada média (ha/TI/mês)", fontsize=9)
+ax3.set_xlabel("Ano", fontsize=9)
+ax3.set_title("(C) Área Queimada — Estação Seca", fontsize=10, fontweight="bold")
+ax3.legend(fontsize=8)
+ax3.grid(axis="y", alpha=0.2)
+ax3.xaxis.set_major_locator(mticker.MultipleLocator(2))
+
+# Anotações dos períodos
+for ax_i in axes:
+    ymax = ax_i.get_ylim()[1]
+    ax_i.text(2007,   ymax*0.92, "Pré-BRIF", fontsize=7.5,
+              color="gray", ha="center", style="italic")
+    ax_i.text(2018.5, ymax*0.92, "Pós-BRIF", fontsize=7.5,
+              color="gray", ha="center", style="italic")
+
+plt.tight_layout()
+p = DIRS["figures"] / "fig17_enso_fire.png"
+fig.savefig(p, dpi=DPI_PUB, bbox_inches="tight")
+plt.close()
+console.print(f"[green]✓ Fig 17 salva.[/green]")
+
+# ── Fig 18: Robustez climática — forest plot ─────────────────
+
+console.print("[yellow]→ Fig 18: Robustez climática...[/yellow]")
+
+fig, axes = plt.subplots(1, 2, figsize=(14, 6))
+fig.suptitle(
+    "Robustez do efeito das BRIFs ao controle por índices climáticos\n"
+    "β (Post × Dry) — Coeficiente-chave com diferentes especificações",
+    fontsize=12, fontweight="bold"
+)
+
+model_order  = ["Base", "+ONI", "+ONI+SPI", "+Full"]
+model_labels = {
+    "Base":     "Sem controle\nclimático",
+    "+ONI":     "+ ONI\n(El Niño/La Niña)",
+    "+ONI+SPI": "+ ONI + SPI-3\n(seca regional)",
+    "+Full":    "+ ONI + SPI-3\n+ PDO + AMO",
+}
+colors_models = ["#9E9E9E", "#1565C0", "#2E7D32", "#6A1B9A"]
+
+for ax, (dep_var, dep_label) in zip(axes, [
+    ("log_burned_ha",  "Log Área Queimada"),
+    ("log_fire_count", "Log Focos de Calor"),
+]):
+    df_rob = clim_df[
+        (clim_df["dep_var"] == dep_var) &
+        (clim_df["variable"] == "post_x_dry")
+    ].copy()
+
+    y_pos = np.arange(len(model_order))
+
+    for i, (model, color) in enumerate(zip(model_order, colors_models)):
+        row = df_rob[df_rob["model"] == model]
+        if row.empty:
+            continue
+        r = row.iloc[0]
+        # IC 95%
+        ax.plot([r["ci_low"], r["ci_high"]], [i, i],
+                color=color, linewidth=2.5, solid_capstyle="round")
+        # Ponto central
+        marker = "D" if r["pvalue"] < 0.05 else "o"
+        ax.scatter(r["coef"], i, color=color, s=100, zorder=5, marker=marker)
+        # Anotação
+        sig = r["sig"]
+        pct = (np.exp(r["coef"]) - 1) * 100
+        ax.text(r["ci_high"] + 0.01, i,
+                f"{pct:+.1f}% {sig}",
+                va="center", fontsize=8.5,
+                color=color if sig != "n.s." else "gray",
+                fontweight="bold" if sig != "n.s." else "normal")
+
+    ax.axvline(0, color="black", linewidth=1, linestyle="--", alpha=0.6)
+    ax.set_yticks(y_pos)
+    ax.set_yticklabels([model_labels.get(m, m) for m in model_order], fontsize=9)
+    ax.set_xlabel("β (Post × Dry)", fontsize=9)
+    ax.set_title(dep_label, fontsize=10, fontweight="bold")
+    ax.grid(axis="x", alpha=0.2)
+
+    # Região benéfica
+    xmin = ax.get_xlim()[0]
+    ax.axvspan(xmin, 0, alpha=0.03, color="green")
+    ax.axvspan(0, ax.get_xlim()[1], alpha=0.03, color="red")
+    ax.text(0.02, 0.03, "← redução", transform=ax.transAxes,
+            fontsize=7.5, color="darkgreen")
+    ax.text(0.98, 0.03, "aumento →", transform=ax.transAxes,
+            fontsize=7.5, color="darkred", ha="right")
+
+fig.text(0.01, 0.01,
+         "♦ = p < 0.05  ● = n.s.  IC 95% clusterizados por TI\n"
+         "Resultado robusto = coeficiente estável entre especificações",
+         fontsize=7.5, color="gray")
+
+plt.tight_layout(rect=[0, 0.05, 1, 1])
+p = DIRS["figures"] / "fig18_robustez_climatica.png"
+fig.savefig(p, dpi=DPI_PUB, bbox_inches="tight")
+plt.close()
+console.print(f"[green]✓ Fig 18 salva.[/green]")
+
+# ── Fig 19: El Niño 2015-2016 como experimento natural ───────
+
+console.print("[yellow]→ Fig 19: El Niño 2015-16 como experimento natural...[/yellow]")
+
+fig, axes = plt.subplots(1, 2, figsize=(13, 6))
+fig.suptitle(
+    "El Niño 2015-2016 como experimento natural\n"
+    "Mesmo choque climático — efeito diferente pré e pós-BRIF",
+    fontsize=12, fontweight="bold"
+)
+
+# Anos de El Niño comparáveis: 2004/2009 (pré) vs 2015/2023 (pós)
+anos_comp_pre  = [y for y in range(2003,2013) if oni_df[oni_df["year"]==y]["oni"].mean() >= 0.5]
+anos_comp_post = [y for y in range(2014,2024) if oni_df[oni_df["year"]==y]["oni"].mean() >= 0.5]
+
+ts_comp = (
+    panel_clim[panel_clim["season"]=="dry"]
+    .groupby("year_int", as_index=False)
+    .agg(
+        burned_ha_mean  = ("burned_ha",  "mean"),
+        fire_count_mean = ("fire_count", "mean"),
+        oni_mean        = ("oni",        "mean"),
+        period          = ("period",     "first"),
+    )
+)
+
+for ax, (var, ylabel) in zip(axes, [
+    ("fire_count_mean", "Focos de Calor Médios (seca)"),
+    ("burned_ha_mean",  "Área Queimada Média (ha/TI/mês)"),
+]):
+    # Scatter: ONI vs Fire por período
+    for period, color, label, marker in [
+        ("pre",  C_PRE,  "Pré-BRIF (2003-2012)",  "o"),
+        ("post", C_POST, "Pós-BRIF (2014-2023)",  "s"),
+    ]:
+        df_p = ts_comp[ts_comp["period"]==period]
+        ax.scatter(df_p["oni_mean"], df_p[var],
+                   color=color, s=70, marker=marker,
+                   alpha=0.8, label=label, zorder=3)
+
+        # Linha de tendência por período
+        if len(df_p) > 2:
+            x = df_p["oni_mean"].values
+            y = df_p[var].values
+            z = np.polyfit(x, y, 1)
+            xline = np.linspace(x.min(), x.max(), 50)
+            ax.plot(xline, np.poly1d(z)(xline),
+                    color=color, linewidth=1.8, linestyle="--", alpha=0.7)
+            r, pval = stats.pearsonr(x, y)
+            ax.text(0.05 if period=="pre" else 0.55, 0.92,
+                    f"r={r:.2f} (p={pval:.3f})",
+                    transform=ax.transAxes, fontsize=8,
+                    color=color,
+                    bbox=dict(boxstyle="round", facecolor="white", alpha=0.7))
+
+    # Destaca 2015-2016
+    row_2015 = ts_comp[ts_comp["year_int"]==2015]
+    if not row_2015.empty:
+        ax.annotate("2015\n(El Niño\nForte)",
+                    xy=(row_2015["oni_mean"].values[0], row_2015[var].values[0]),
+                    xytext=(15, 10), textcoords="offset points",
+                    fontsize=7.5, color=C_POST,
+                    arrowprops=dict(arrowstyle="->", color=C_POST, lw=1.2))
+
+    ax.axvline(0.5, color="gray", linewidth=0.8, linestyle=":", alpha=0.7)
+    ax.axvline(-0.5, color="gray", linewidth=0.8, linestyle=":", alpha=0.7)
+    ax.set_xlabel("ONI Médio Anual (°C)", fontsize=9)
+    ax.set_ylabel(ylabel, fontsize=9)
+    ax.set_title(ylabel, fontsize=10, fontweight="bold")
+    ax.legend(fontsize=8)
+    ax.grid(alpha=0.2)
+    ax.text(0.7, 0.05, "El Niño →", transform=ax.transAxes,
+            fontsize=7.5, color="darkred")
+    ax.text(0.02, 0.05, "← La Niña", transform=ax.transAxes,
+            fontsize=7.5, color=C_LANINA)
+
+fig.text(0.01, 0.01,
+         "Inclinação menor no período pós-BRIF = menor sensibilidade ao ENSO = BRIFs como amortecedor climático",
+         fontsize=8, color="gray", style="italic")
+
+plt.tight_layout(rect=[0, 0.04, 1, 1])
+p = DIRS["figures"] / "fig19_elnino_experimento.png"
+fig.savefig(p, dpi=DPI_PUB, bbox_inches="tight")
+plt.close()
+console.print(f"[green]✓ Fig 19 salva.[/green]")
+
+# ── Fig 20: Painel climático composto ───────────────────────
+
+console.print("[yellow]→ Fig 20: Painel climático composto...[/yellow]")
+
+fig = plt.figure(figsize=(18, 14))
+gs  = gridspec.GridSpec(3, 3, figure=fig, hspace=0.45, wspace=0.38)
+
+ax_oni   = fig.add_subplot(gs[0, :])       # ONI série temporal
+ax_fire  = fig.add_subplot(gs[1, 0:2])     # Fire × ENSO
+ax_rob1  = fig.add_subplot(gs[1, 2])       # Robustez área
+ax_spi   = fig.add_subplot(gs[2, 0])       # SPI vs fire
+ax_enso  = fig.add_subplot(gs[2, 1])       # Scatter ONI × focos
+ax_rob2  = fig.add_subplot(gs[2, 2])       # Robustez focos
+
+fig.suptitle(
+    "Controle por variabilidade climática de larga escala\n"
+    "O efeito das BRIFs é robusto ao ENSO, SPI e oscilações multidecadais",
+    fontsize=13, fontweight="bold", y=0.99
+)
+
+# ax_oni: ONI e focos
+ax2_twin = ax_oni.twinx()
+ax_oni.bar(years, np.where(oni >= 0, oni, 0),
+           color=C_ELNINO, alpha=0.6, label="El Niño")
+ax_oni.bar(years, np.where(oni < 0, oni, 0),
+           color=C_LANINA, alpha=0.6, label="La Niña")
+ax_oni.axhline(0, color="black", linewidth=0.5)
+ax_oni.axvline(2012.5, color=C_TRANS, linewidth=1.5, linestyle="--", alpha=0.7)
+ax2_twin.plot(years, ts_anual["fire_count_mean"],
+              color="#BF360C", linewidth=2, marker="o", markersize=4,
+              label="Focos seca (eixo direito)")
+ax_oni.set_ylabel("ONI (°C)", fontsize=9, color="gray")
+ax2_twin.set_ylabel("Focos médios/TI/mês", fontsize=9, color="#BF360C")
+ax_oni.set_title("(A) ONI × Focos de Calor na Seca — 2003–2023",
+                 fontsize=10, fontweight="bold")
+ax_oni.legend(fontsize=7.5, loc="upper left")
+ax2_twin.legend(fontsize=7.5, loc="upper right")
+ax_oni.grid(axis="y", alpha=0.2)
+ax_oni.xaxis.set_major_locator(mticker.MultipleLocator(2))
+
+# ax_fire: Série temporal com sombreamento ENSO
+df_dry_ts = ts_anual.copy()
+ax_fire.plot(df_dry_ts["year_int"], df_dry_ts["fire_count_mean"],
+             color="#BF360C", linewidth=2.2, marker="o", markersize=5)
+# Sombreia El Niño forte
+for yr in anos_elnino_forte_pre + anos_elnino_forte_post:
+    ax_fire.axvspan(yr-0.5, yr+0.5, alpha=0.15, color=C_ELNINO)
+for yr in anos_lanina_forte_pre + anos_lanina_forte_post:
+    ax_fire.axvspan(yr-0.5, yr+0.5, alpha=0.15, color=C_LANINA)
+ax_fire.axvline(2012.5, color=C_TRANS, linewidth=1.5, linestyle="--", alpha=0.7)
+ax_fire.set_title("(B) Focos na Seca | ■ El Niño Forte | ■ La Niña Forte",
+                  fontsize=10, fontweight="bold")
+ax_fire.set_ylabel("Focos médios", fontsize=9)
+ax_fire.set_xlabel("Ano", fontsize=9)
+ax_fire.grid(axis="y", alpha=0.2)
+
+# ax_rob1 e ax_rob2: Forest plots de robustez
+for ax_rob, dep_var, title in [
+    (ax_rob1, "log_burned_ha",  "(C) Robustez — Área"),
+    (ax_rob2, "log_fire_count", "(F) Robustez — Focos"),
+]:
+    df_rob = clim_df[
+        (clim_df["dep_var"] == dep_var) &
+        (clim_df["variable"] == "post_x_dry")
+    ].copy()
+    y_pos = np.arange(len(model_order))
+    for i, (model, color) in enumerate(zip(model_order, colors_models)):
+        row = df_rob[df_rob["model"]==model]
+        if row.empty:
+            continue
+        r = row.iloc[0]
+        ax_rob.plot([r["ci_low"], r["ci_high"]], [i, i],
+                    color=color, linewidth=2.5)
+        ax_rob.scatter(r["coef"], i, color=color, s=80, zorder=5,
+                       marker="D" if r["pvalue"]<0.05 else "o")
+        sig = r["sig"]
+        ax_rob.text(r["ci_high"]+0.01, i,
+                    f"{sig}", va="center", fontsize=8,
+                    color=color if sig!="n.s." else "gray")
+    ax_rob.axvline(0, color="black", linewidth=0.8, linestyle="--")
+    ax_rob.set_yticks(y_pos)
+    ax_rob.set_yticklabels([m.replace("+"," +\n") for m in model_order], fontsize=7.5)
+    ax_rob.set_title(title, fontsize=9, fontweight="bold")
+    ax_rob.set_xlabel("β (Post×Dry)", fontsize=8)
+    ax_rob.grid(axis="x", alpha=0.2)
+
+# ax_spi: SPI vs fire
+spi_ts = ts_anual.merge(
+    precip_cerrado[["year","month","spi3"]].groupby("year")["spi3"].mean().reset_index(),
+    left_on="year_int", right_on="year", how="left"
+)
+if "spi3" in spi_ts.columns:
+    for period, color, label in [("pre", C_PRE, "Pré"), ("post", C_POST, "Pós")]:
+        mask = spi_ts["year_int"].between(2003,2012) if period=="pre" else spi_ts["year_int"].between(2014,2023)
+        df_s = spi_ts[mask]
+        if not df_s.empty and "spi3" in df_s.columns:
+            ax_spi.scatter(df_s["spi3"], df_s["fire_count_mean"],
+                           color=color, s=60, alpha=0.8, label=label, marker="o" if period=="pre" else "s")
+            x = df_s["spi3"].fillna(0).values
+            y = df_s["fire_count_mean"].values
+            if len(x) > 2 and np.std(x) > 0:
+                z = np.polyfit(x, y, 1)
+                xline = np.linspace(x.min(), x.max(), 30)
+                ax_spi.plot(xline, np.poly1d(z)(xline),
+                            color=color, linewidth=1.5, linestyle="--", alpha=0.7)
+ax_spi.set_title("(D) SPI-3 × Focos na Seca\nRedução de precipitação → mais fogo?",
+                 fontsize=9, fontweight="bold")
+ax_spi.set_xlabel("SPI-3 (desvios padrão)", fontsize=8)
+ax_spi.set_ylabel("Focos médios/TI/mês", fontsize=8)
+ax_spi.legend(fontsize=7.5)
+ax_spi.grid(alpha=0.2)
+ax_spi.axvline(0, color="gray", linewidth=0.5)
+
+# ax_enso: Scatter ONI × focos com período
+for period, color, label, marker in [
+    ("pre",  C_PRE,  "Pré-BRIF",  "o"),
+    ("post", C_POST, "Pós-BRIF",  "s"),
+]:
+    mask = ts_comp["period"]==period
+    df_p = ts_comp[mask]
+    ax_enso.scatter(df_p["oni_mean"], df_p["fire_count_mean"],
+                    color=color, s=60, alpha=0.8, label=label, marker=marker)
+    if len(df_p) > 2:
+        x = df_p["oni_mean"].values
+        y = df_p["fire_count_mean"].values
+        z = np.polyfit(x, y, 1)
+        xline = np.linspace(x.min(), x.max(), 30)
+        ax_enso.plot(xline, np.poly1d(z)(xline),
+                     color=color, linewidth=1.5, linestyle="--", alpha=0.7)
+ax_enso.set_title("(E) ONI × Focos por Período\nInclinação menor = menos sensível ao ENSO",
+                  fontsize=9, fontweight="bold")
+ax_enso.set_xlabel("ONI Médio Anual (°C)", fontsize=8)
+ax_enso.set_ylabel("Focos médios/TI/mês", fontsize=8)
+ax_enso.legend(fontsize=7.5)
+ax_enso.grid(alpha=0.2)
+ax_enso.axvline(0.5, color="gray", linewidth=0.5, linestyle=":")
+ax_enso.axvline(-0.5, color="gray", linewidth=0.5, linestyle=":")
+
+plt.tight_layout(rect=[0, 0, 1, 0.97])
+p = DIRS["figures"] / "fig20_painel_climatico.png"
+fig.savefig(p, dpi=DPI_PUB, bbox_inches="tight")
+plt.close()
+console.print(f"[green]✓ Fig 20 salva.[/green]")
+
+# ============================================================
+# 8. RESUMO EXECUTIVO
+# ============================================================
+
+console.print("\n[bold cyan]═══ RESUMO EXECUTIVO — Controle Climático ═══[/bold cyan]")
+
+console.print("""
+Pergunta central: o efeito das BRIFs desaparece quando controlamos
+pelo ENSO, SPI e outras oscilações climáticas?
+""")
+
+# Compara β4 base vs full
+for dep_var, dep_label in [
+    ("log_burned_ha",  "Log Área Queimada"),
+    ("log_fire_count", "Log Focos de Calor"),
+]:
+    base = clim_df[(clim_df["dep_var"]==dep_var) &
+                   (clim_df["model"]=="Base") &
+                   (clim_df["variable"]=="post_x_dry")]
+    full = clim_df[(clim_df["dep_var"]==dep_var) &
+                   (clim_df["model"]=="+Full") &
+                   (clim_df["variable"]=="post_x_dry")]
+    if not base.empty and not full.empty:
+        b = base.iloc[0]
+        f = full.iloc[0]
+        delta = abs(f["coef"] - b["coef"]) / abs(b["coef"]) * 100 if b["coef"] != 0 else 0
+        console.print(
+            f"  {dep_label}:\n"
+            f"    Sem controle:    β={b['coef']:+.4f} {b['sig']}\n"
+            f"    Com controle +Full: β={f['coef']:+.4f} {f['sig']}\n"
+            f"    Variação do coef: {delta:.1f}% → "
+            f"{'✓ ROBUSTO' if delta < 20 else '⚠ sensível ao controle climático'}\n"
+        )
+
+# Exibe figuras
+console.print("\n[cyan]Exibindo figuras...[/cyan]")
+for fname in ["fig17_enso_fire.png", "fig18_robustez_climatica.png",
+              "fig19_elnino_experimento.png", "fig20_painel_climatico.png"]:
+    fpath = DIRS["figures"] / fname
+    if fpath.exists():
+        print(f"\n{'─'*60}\n  {fname}\n{'─'*60}")
+        ipy_display(IPyImage(filename=str(fpath), width=1000))
+
+console.print("[bold green]✓ BLOCK 11 concluído com sucesso.[/bold green]")

@@ -1,5 +1,7 @@
 # ============================================================
 # BLOCK 12 — FINAL PUBLICATION FIGURES
+# No placebo | No invented data | No subsampling | No clipping
+#
 # Figure order:
 #   Fig 1 — Core empirical pattern
 #   Fig 2 — Spatial counterfactual and treatment contrast

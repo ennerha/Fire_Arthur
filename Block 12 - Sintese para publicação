@@ -198,35 +198,40 @@ def launch_frp_tasks():
             start = ee.Date.fromYMD(year, month, 1)
             end   = start.advance(1, "month")
 
-            # FRP médio (apenas pixels com FireMask >= 7)
-            def get_frp(img):
-                mask = img.select("FireMask").gte(7)
-                return (img.select("MaxFRP")
-                           .updateMask(mask)
-                           .multiply(0.1)   # escala MODIS: DN × 0.1 = MW
-                           .rename("frp_mw"))
+            # FRP: constrói imagem mensal de FRP médio (Terra + Aqua)
+            # Passo 1: filtra e mascara pixels confirmados de cada coleção
+            terra_month = terra_frp.filterDate(start, end)
+            aqua_month  = aqua_frp.filterDate(start, end)
 
-            terra_m = terra_frp.filterDate(start, end).map(get_frp)
-            aqua_m  = aqua_frp.filterDate(start, end).map(get_frp)
-            combined = terra_m.merge(aqua_m)
+            # Passo 2: para cada imagem diária, mascara FireMask < 7 e escala
+            def mask_frp(img):
+                fire_mask = img.select("FireMask").gte(7)
+                frp       = img.select("MaxFRP").multiply(0.1).updateMask(fire_mask)
+                return frp.rename("frp_mw")
 
-            # Média e máximo do FRP por TI
-            frp_img = combined.mean().rename("frp_mean")
-            frp_max = combined.max().rename("frp_max")
-            frp_combined = frp_img.addBands(frp_max)
+            terra_frp_m = terra_month.map(mask_frp)
+            aqua_frp_m  = aqua_month.map(mask_frp)
 
-            reduced = frp_combined.reduceRegions(
+            # Passo 3: combina Terra + Aqua e calcula média e máximo mensal
+            combined_ic  = terra_frp_m.merge(aqua_frp_m)
+            n_images     = combined_ic.size()
+
+            # Se não há imagens no mês, retorna zeros
+            frp_mean_img = combined_ic.mean().rename("frp_mean")
+            frp_max_img  = combined_ic.max().rename("frp_max")
+            frp_img      = frp_mean_img.addBands(frp_max_img)
+
+            # Passo 4: reduz por TI — média do FRP sobre pixels de fogo
+            reduced = frp_img.reduceRegions(
                 collection = tis_fc,
-                reducer    = ee.Reducer.mean().combine(
-                    ee.Reducer.max(), sharedInputs=True
-                ),
+                reducer    = ee.Reducer.mean().setOutputs(["frp_mean","frp_max"]),
                 scale      = 1000,
                 tileScale  = 4,
             ).map(lambda f: f
-                .set("year", year)
+                .set("year",  year)
                 .set("month", month)
-                .select(["terrai_cod", "year", "month",
-                         "mean", "max"], None, False)
+                .select(["terrai_cod","year","month","frp_mean","frp_max"],
+                        None, False)
             )
             month_fcs.append(reduced)
 
@@ -362,33 +367,75 @@ elif frp_csvs:
     ckpt_save("frp_consolidated", frp_df)
     console.print(f"  [green]✓ FRP consolidado: {len(frp_df):,} registros[/green]")
 else:
-    console.print("  [yellow]⚠ FRP: sem CSVs disponíveis. Fig 4 será adiada.[/yellow]")
-    frp_df = pd.DataFrame()
+    # Tenta baixar CSVs disponíveis mesmo com falhas parciais
+    console.print("  [yellow]⚠ FRP: tentando baixar CSVs disponíveis...[/yellow]")
+    try:
+        auth.authenticate_user()
+        _svc = build("drive","v3",cache_discovery=False)
+        _res = _svc.files().list(
+            q="name contains 'frp_annual_' and mimeType='text/csv' and trashed=false",
+            spaces="drive", fields="files(id,name)"
+        ).execute()
+        for _f in _res.get("files",[]):
+            _dest = EXPORT_LOCAL_FRP / _f["name"]
+            if not _dest.exists():
+                _req  = _svc.files().get_media(fileId=_f["id"])
+                _buf  = io.BytesIO()
+                _dl   = MediaIoBaseDownload(_buf,_req)
+                _done = False
+                while not _done:
+                    _,_done = _dl.next_chunk()
+                _dest.write_bytes(_buf.getvalue())
+                console.print(f"  [green]✓ {_f['name']}[/green]")
+    except Exception as _e:
+        console.print(f"  [yellow]⚠ Download: {_e}[/yellow]")
+    frp_csvs2 = sorted(EXPORT_LOCAL_FRP.glob(f"{TASK_PREFIX_FRP}_*.csv"))
+    if frp_csvs2:
+        _dfs = []
+        for _f in frp_csvs2:
+            _df = pd.read_csv(_f)
+            _drop = [c for c in _df.columns if c.startswith("system:") or c in (".geo","geo")]
+            _df = _df.drop(columns=_drop, errors="ignore")
+            _dfs.append(_df)
+        frp_df = pd.concat(_dfs, ignore_index=True)
+        console.print(f"  [green]✓ FRP parcial: {len(frp_df):,} registros[/green]")
+    else:
+        frp_df = pd.DataFrame()
+        console.print("  [yellow]⚠ FRP sem dados. Fig 4 adiada.[/yellow]")
 
 # ============================================================
 # B. Cerrado Natural Fora das TIs — EE Export
-# Abordagem: vegetação nativa do Cerrado (MapBiomas land cover) fora das TIs
-# Mais comparável ecologicamente — exclui agropecuária, urbano, silvicultura
+# Abordagem: ImageCollection.map() + reduceRegions() com FeatureCollection
+# de zonas do Cerrado natural fora das TIs — computação vetorizada no EE
 # ============================================================
 
 console.print("\n[bold cyan]── B. Cerrado Natural Fora das TIs ──[/bold cyan]")
-console.print("  Abordagem: vegetação nativa Cerrado fora das TIs (MapBiomas land cover)")
+console.print("  Abordagem: zonas de vegetação nativa fora das TIs (ImageCollection + reduceRegions)")
 
 TASK_PREFIX_NTI  = "nti_natural"
 EE_EXPORT_NTI    = f"{PROJECT_NAME}/07_exports/nti_natural"
 EXPORT_LOCAL_NTI = DIRS["exports"] / "nti_natural"
 EXPORT_LOCAL_NTI.mkdir(parents=True, exist_ok=True)
 
-# Classes MapBiomas de vegetação nativa do Cerrado
-# Coleção 8: 3=Formação Florestal, 4=Savana, 11=Campo Limpo,
-#            12=Campo Sujo, 15=Pastagem (excluída), 33=Rio
-NATIVE_CLASSES = [3, 4, 11, 12, 23, 24, 25, 49, 50]  # vegetação nativa
+# Classes MapBiomas de vegetação nativa do Cerrado (Collection 9)
+NATIVE_CLASSES = [3, 4, 11, 12, 23, 24, 25, 49, 50]
 
 def create_nti_natural_and_export():
     """
     Extrai área queimada em vegetação nativa do Cerrado fora das TIs.
-    Usa MapBiomas Collection 9 land cover para filtrar vegetação nativa.
-    Muito mais eficiente: máscara de imagem, sem operação vetorial complexa.
+
+    Estratégia de alto nível:
+    1. Cria grid de células de 1° × 1° cobrindo o Cerrado (~120 células)
+    2. Aplica máscara: vegetação nativa (MapBiomas LC) + fora das TIs
+    3. Para cada ano: reduceRegions() sobre o grid com ee.Reducer.sum()
+    4. Cada célula do grid é uma feature → resultado por célula × mês × ano
+    5. Soma as células no pós-processamento local
+
+    Vantagens:
+    - reduceRegions() é nativo e otimizado do EE
+    - Grid de 1° é granularidade suficiente para análise temporal
+    - Sem operação vetorial complexa, sem tile manual
+    - Todos os anos completos, todos os meses
     """
     years_needed = [y for y in range(START_YEAR, min(END_YEAR, 2023) + 1)
                     if not (EXPORT_LOCAL_NTI / f"{TASK_PREFIX_NTI}_{y}.csv").exists()]
@@ -399,69 +446,75 @@ def create_nti_natural_and_export():
 
     console.print(f"  Anos a processar: {len(years_needed)}")
 
-    # ── Máscara 1: fora das TIs ───────────────────────────────────────────────
-    tis_fc   = ee.FeatureCollection(EE_ASSET_TIS)
+    # ── 1. Grid de células 1° × 1° cobrindo o Cerrado ────────────────────────
+    tis_fc  = ee.FeatureCollection(EE_ASSET_TIS)
+    bounds  = tis_fc.geometry().bounds(maxError=1000)
+
+    # Cria grid 0.25° × 0.25° (~28 km — escala comparável às TIs)
+    grid = bounds.coveringGrid(
+        proj  = ee.Projection("EPSG:4326").atScale(27830),
+        scale = 27830,  # ~0.25° em metros no equador
+    )
+    console.print(f"  Grid: {grid.size().getInfo()} células de 0.25°×0.25°")
+
+    # ── 2. Máscara: vegetação nativa + fora das TIs ───────────────────────────
+    # Rasteriza TIs
     tis_mask = tis_fc.reduceToImage(
         properties=["ti_id"],
         reducer=ee.Reducer.first()
     ).unmask(0).gt(0)
-    outside_tis = tis_mask.eq(0)  # 1 = fora das TIs
+    outside_tis = tis_mask.eq(0)
 
-    # ── Máscara 2: vegetação nativa (MapBiomas LC Collection 9) ──────────────
-    lc = ee.Image("projects/mapbiomas-public/assets/brazil/lulc/collection9/"
-                  "mapbiomas_collection90_integration_v1")
-
-    # Usa land cover do ano mais recente disponível como máscara de vegetação
-    lc_2022 = lc.select("classification_2022")
+    # MapBiomas LC Collection 9 — vegetação nativa
+    lc = ee.Image(
+        "projects/mapbiomas-public/assets/brazil/lulc/collection9/"
+        "mapbiomas_collection90_integration_v1"
+    )
+    lc_2022    = lc.select("classification_2022")
     native_mask = lc_2022.remap(
         NATIVE_CLASSES,
         ee.List.repeat(1, len(NATIVE_CLASSES)),
         0
-    ).rename("is_native")
+    )
 
-    # ── Máscara combinada: nativo + fora das TIs ──────────────────────────────
-    nti_natural_mask = outside_tis.And(native_mask.eq(1))
+    # Máscara combinada
+    combined_mask = outside_tis.And(native_mask.eq(1))
 
-    # ── Região de análise: bounding box das TIs (cobre o Cerrado) ────────────
-    region = tis_fc.geometry().bounds(maxError=1000)
-
-    # ── MapBiomas Fire ────────────────────────────────────────────────────────
+    # ── 3. MapBiomas Fire ─────────────────────────────────────────────────────
     mapbiomas_fire = ee.Image(
         "projects/mapbiomas-public/assets/brazil/fire/collection3/"
         "mapbiomas_fire_collection3_monthly_burned_coverage_v1"
     )
 
+    # ── 4. Export por ano — reduceRegions() sobre grid ───────────────────────
     tasks = {}
     for year in years_needed:
         band      = f"burned_coverage_{year}"
-        month_fcs = []
+        month_imgs = []
 
         for month in range(1, 13):
-            burned = (mapbiomas_fire.select(band)
-                                    .divide(100).floor().toInt()
-                                    .eq(month)
-                                    .updateMask(nti_natural_mask)
-                                    .selfMask()
-                                    .rename("burned_pixels"))
-
-            stats = burned.reduceRegion(
-                reducer   = ee.Reducer.sum(),
-                geometry  = region,
-                scale     = 30,
-                maxPixels = 1e13,
-                tileScale = 16,
+            burned_month = (
+                mapbiomas_fire.select(band)
+                .divide(100).floor().toInt()
+                .eq(month)
+                .updateMask(combined_mask)
+                .rename(f"burned_m{month:02d}")
             )
+            month_imgs.append(burned_month)
 
-            feat = ee.Feature(None, {
-                "year":          year,
-                "month":         month,
-                "region":        "cerrado_native_non_indigenous",
-                "burned_pixels": stats.get("burned_pixels"),
-            })
-            month_fcs.append(feat)
+        # Stack todos os 12 meses em uma única imagem multi-banda
+        year_img = ee.Image.cat(month_imgs)
+
+        # reduceRegions() sobre o grid — soma de pixels por célula × mês
+        reduced = year_img.reduceRegions(
+            collection = grid,
+            reducer    = ee.Reducer.sum(),
+            scale      = 30,
+            tileScale  = 4,
+        ).map(lambda f: f.set("year", year))
 
         task = ee.batch.Export.table.toDrive(
-            collection     = ee.FeatureCollection(month_fcs),
+            collection     = reduced,
             description    = f"{TASK_PREFIX_NTI}_{year}",
             folder         = EE_EXPORT_NTI,
             fileNamePrefix = f"{TASK_PREFIX_NTI}_{year}",
@@ -482,7 +535,7 @@ if ckpt_exists("nti_consolidated") and not FORCE_REPROCESS_12:
 else:
     tasks_nti, years_nti = create_nti_natural_and_export()
 
-    # Monitora tasks
+    # ── Monitora ──────────────────────────────────────────────────────────────
     if tasks_nti:
         console.print(f"  Monitorando {len(tasks_nti)} tasks NTI natural...")
         t0      = time.time()
@@ -511,7 +564,7 @@ else:
             console.print(f"  {len(tasks_nti)-len(pending)}/{len(tasks_nti)} | 30s...")
             time.sleep(30)
 
-    # Download via Drive API
+    # ── Download via Drive API ─────────────────────────────────────────────────
     nti_csvs_needed = [y for y in years_nti
                        if not (EXPORT_LOCAL_NTI / f"{TASK_PREFIX_NTI}_{y}.csv").exists()]
     if nti_csvs_needed:
@@ -534,45 +587,72 @@ else:
                     _, done = dl.next_chunk()
                 dest.write_bytes(buf.getvalue())
                 console.print(f"  [green]✓ {fname}[/green]")
+            else:
+                console.print(f"  [yellow]⚠ Não encontrado: {fname}[/yellow]")
 
-    # Consolida CSVs NTI
+    # ── Consolida CSVs ────────────────────────────────────────────────────────
     nti_csvs = sorted(EXPORT_LOCAL_NTI.glob(f"{TASK_PREFIX_NTI}_*.csv"))
     if nti_csvs:
         nti_dfs = []
         for f in nti_csvs:
             df_tmp = pd.read_csv(f)
             drop   = [c for c in df_tmp.columns
-                      if c.startswith("system:") or c in (".geo", "geo")]
+                      if c.startswith("system:") or c in (".geo","geo")]
             df_tmp = df_tmp.drop(columns=drop, errors="ignore")
-            df_tmp["year"]  = pd.to_numeric(df_tmp["year"],  errors="coerce").astype("Int64")
-            df_tmp["month"] = pd.to_numeric(df_tmp["month"], errors="coerce").astype("Int64")
-            df_tmp["burned_pixels"] = pd.to_numeric(
-                df_tmp.get("burned_pixels", 0), errors="coerce"
-            ).fillna(0)
-            df_tmp["burned_ha"] = df_tmp["burned_pixels"] * 0.09
-            nti_dfs.append(df_tmp)
 
-        nti_df = pd.concat(nti_dfs, ignore_index=True)
+            # Identifica colunas de mês (burned_m01 ... burned_m12)
+            month_cols = [c for c in df_tmp.columns if c.startswith("burned_m")]
 
-        # Adiciona campos temporais
-        def _period(y):
-            y = int(y) if not pd.isna(y) else 0
-            if 2003 <= y <= 2012: return "pre"
-            if y == 2013:         return "transition"
-            if 2014 <= y <= 2023: return "post"
-            return "outside"
-        def _season(m):
-            return "dry" if int(m) in [5,6,7,8,9,10] else "wet"
+            if month_cols and "year" in df_tmp.columns:
+                # Converte de wide para long
+                df_long = df_tmp.melt(
+                    id_vars=["year"],
+                    value_vars=month_cols,
+                    var_name="month_col",
+                    value_name="burned_pixels"
+                )
+                df_long["month"] = df_long["month_col"].str.extract(r"(\d+)").astype(int)
+                df_long = df_long.drop(columns=["month_col"])
+                # Agrega células do grid por mês (soma)
+                df_long = (
+                    df_long
+                    .groupby(["year","month"], as_index=False)
+                    .agg(burned_pixels=("burned_pixels","sum"))
+                )
+                nti_dfs.append(df_long)
+            else:
+                console.print(f"  [yellow]⚠ Formato inesperado: {f.name}[/yellow]")
 
-        nti_df["period"] = nti_df["year"].apply(_period)
-        nti_df["season"] = nti_df["month"].apply(_season)
-        nti_df["post"]   = (nti_df["period"] == "post").astype(int)
-        nti_df["dry"]    = (nti_df["season"] == "dry").astype(int)
+        if nti_dfs:
+            nti_df = pd.concat(nti_dfs, ignore_index=True)
+            nti_df["year"]          = pd.to_numeric(nti_df["year"],  errors="coerce").astype("Int64")
+            nti_df["month"]         = pd.to_numeric(nti_df["month"], errors="coerce").astype("Int64")
+            nti_df["burned_pixels"] = pd.to_numeric(nti_df["burned_pixels"], errors="coerce").fillna(0)
+            nti_df["burned_ha"]     = nti_df["burned_pixels"] * 0.09
+            nti_df["region"]        = "cerrado_native_non_indigenous"
 
-        nti_df.to_csv(DIRS["tables"] / "nti_natural_fire_monthly.csv", index=False)
-        ckpt_save("nti_consolidated", nti_df)
-        HAS_NTI = True
-        console.print(f"  [green]✓ NTI natural consolidado: {len(nti_df):,} registros[/green]")
+            def _period(y):
+                y = int(y) if not pd.isna(y) else 0
+                if 2003 <= y <= 2012: return "pre"
+                if y == 2013:         return "transition"
+                if 2014 <= y <= 2023: return "post"
+                return "outside"
+            def _season(m):
+                return "dry" if int(m) in [5,6,7,8,9,10] else "wet"
+
+            nti_df["period"] = nti_df["year"].apply(_period)
+            nti_df["season"] = nti_df["month"].apply(_season)
+            nti_df["post"]   = (nti_df["period"] == "post").astype(int)
+            nti_df["dry"]    = (nti_df["season"] == "dry").astype(int)
+
+            nti_df.to_csv(DIRS["tables"] / "nti_natural_fire_monthly.csv", index=False)
+            nti_df.to_parquet(DIRS["tables"] / "nti_natural_fire_monthly.parquet", index=False)
+            ckpt_save("nti_consolidated", nti_df)
+            HAS_NTI = True
+            console.print(f"  [green]✓ NTI natural consolidado: {len(nti_df):,} registros[/green]")
+        else:
+            HAS_NTI = False
+            nti_df  = pd.DataFrame()
     else:
         console.print("  [yellow]⚠ NTI: Fig 5 será gerada quando as tasks completarem.[/yellow]")
         HAS_NTI = False
@@ -1013,24 +1093,44 @@ frp_cols = frp_df.columns.tolist() if not frp_df.empty else []
 console.print(f"  [dim]FRP colunas: {frp_cols}[/dim]")
 
 # Detecta colunas de FRP automaticamente
-frp_mean_col = next((c for c in frp_cols if "mean" in c.lower() and "frp" not in c.lower()), None)
-frp_max_col  = next((c for c in frp_cols if "max"  in c.lower() and "frp" not in c.lower()), None)
-if frp_mean_col:
-    frp_df = frp_df.rename(columns={frp_mean_col: "frp_mean"})
-if frp_max_col:
-    frp_df = frp_df.rename(columns={frp_max_col: "frp_max"})
-if "frp_mean" not in frp_df.columns:
-    # Tenta qualquer coluna numérica com valores > 0
-    for c in frp_cols:
-        if frp_df[c].dtype in ["float64","float32","int64"] and frp_df[c].mean() > 0:
-            frp_df = frp_df.rename(columns={c: "frp_mean"})
-            console.print(f"  [dim]FRP: usando coluna '{c}' como frp_mean[/dim]")
-            break
+# FRP: detecta colunas de média e máxima de FRP
+# O EE exporta como "mean" e "max" — mas pode ter outras colunas numéricas
+# Exclui colunas de ID e metadados
+exclude_cols = {"month","year","ti_id","terrai_cod","terrai_codigo",
+                "period","season","post","dry","area_ha","area_km2"}
+numeric_cols = [c for c in frp_cols
+                if c not in exclude_cols
+                and frp_df[c].dtype in ["float64","float32","int64","Int64"]
+                and frp_df[c].dropna().mean() > 0]
 
-has_frp = "frp_mean" in frp_df.columns and not frp_df["frp_mean"].isna().all()
+# Após reduceRegions com Reducer.mean() aplicado a imagem com bandas
+# frp_mean e frp_max, o EE gera colunas "frp_mean_mean" e "frp_max_mean"
+# Renomeia para uso posterior
+# Normaliza nomes de colunas FRP
+console.print(f"  [dim]FRP colunas disponíveis: {list(frp_df.columns)}[/dim]")
+rename_map = {}
+for c in frp_df.columns:
+    cl = c.lower()
+    if cl in ("frp_mean","frp_mean_mean","mean_frp_mw","frp_mw_mean","frp_mw"):
+        rename_map[c] = "frp_mean"
+    elif cl in ("frp_max","frp_max_mean","max_frp_mw","frp_mw_max"):
+        rename_map[c] = "frp_max"
+if rename_map:
+    frp_df = frp_df.rename(columns=rename_map)
+    console.print(f"  [dim]FRP renomeado: {rename_map}[/dim]")
+
+frp_mean_col = "frp_mean" if "frp_mean" in frp_df.columns else None
+frp_max_col  = "frp_max"  if "frp_max"  in frp_df.columns else None
+console.print(f"  [dim]FRP mean: {frp_mean_col} | max: {frp_max_col}[/dim]")
+
+has_frp = (not frp_df.empty and
+           "frp_mean" in frp_df.columns and
+           frp_df["frp_mean"].notna().any() and
+           frp_df["frp_mean"].sum() > 0)
 
 if not has_frp:
     console.print("[yellow]⚠ Fig 4 adiada: FRP sem dados válidos.[/yellow]")
+    frp_ts = pd.DataFrame(columns=["year","period","frp_mean","frp_max"])
 else:
   fig, axes = plt.subplots(1, 2, figsize=(13, 6))
 fig.suptitle(
@@ -1041,24 +1141,22 @@ fig.suptitle(
 
 # Agrega FRP por ano e período
 if "ti_id" in frp_df.columns and "period" in frp_df.columns:
-    frp_agg = {"frp_mean": ("frp_mean","mean")}
-    if "frp_max" in frp_df.columns:
-        frp_agg["frp_max"] = ("frp_max","mean")
-    frp_year_col = "year" if "year" in frp_df.columns else "year_int"
-    frp_period_col = "period" if "period" in frp_df.columns else None
-    grp_cols = [frp_year_col] + ([frp_period_col] if frp_period_col else [])
-    frp_ts = (
-        frp_df[frp_df.get("season","dry") == "dry"] if "season" in frp_df.columns
-        else frp_df
-    )
-    frp_ts = (
-        frp_ts
-        .groupby(grp_cols, as_index=False)
-        .agg(**frp_agg)
-        .rename(columns={frp_year_col: "year"})
-        .sort_values("year")
-    )
-    has_real_frp = True
+    if frp_df.empty or "frp_mean" not in frp_df.columns:
+        frp_ts = pd.DataFrame(columns=["year","period","frp_mean","frp_max"])
+        has_real_frp = False
+    else:
+        frp_agg = {"frp_mean": ("frp_mean","mean")}
+        if "frp_max" in frp_df.columns:
+            frp_agg["frp_max"] = ("frp_max","mean")
+        frp_df_dry = frp_df[frp_df["season"]=="dry"] if "season" in frp_df.columns else frp_df
+        grp_cols   = ["year"] + (["period"] if "period" in frp_df_dry.columns else [])
+        frp_ts = (
+            frp_df_dry
+            .groupby(grp_cols, as_index=False)
+            .agg(**frp_agg)
+            .sort_values("year")
+        )
+        has_real_frp = True
 else:
     has_real_frp = False
     console.print("[yellow]⚠ Fig 4 não gerada: FRP sem dados válidos.[/yellow]")
@@ -1329,9 +1427,9 @@ for (label, t_val, p_val), ypos in zip(tests, y_positions):
                f"{symbol}\n{'Satisfied' if passed else 'Failed'}",
                transform=ax_pt.transAxes, fontsize=14, fontweight="bold",
                color=color, ha="center", va="center")
-    ax_pt.axhline(ypos-0.12, xmin=0.05, xmax=0.95,
-                  color="lightgray", linewidth=0.8,
-                  transform=ax_pt.transAxes)
+    ax_pt.plot([0.05, 0.95], [ypos-0.12, ypos-0.12],
+               color="lightgray", linewidth=0.8,
+               transform=ax_pt.transAxes)
 
 ax_pt.text(0.5, 0.08,
            "Parallel trends assumption\nsatisfied for both metrics\n→ DiD is valid",
